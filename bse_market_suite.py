@@ -2348,6 +2348,336 @@ elif page == "Insights":
 #  PAGE: MY ACTIVITY
 # ═════════════════════════════════════════════════════════════════════════════
 
+elif page == "Calculators":
+
+    st.markdown("""<div class="page-head">
+      <h1>🧮 Calculators</h1>
+      <p>Quick-fire investing &amp; tax tools — stock average, SIP, CAGR, capital gains, brokerage, FD, DCF &amp; Reverse DCF</p>
+    </div>""", unsafe_allow_html=True)
+
+    calc1, calc2, calc3, calc4, calc5, calc6, calc7, calc8 = st.tabs([
+        "📈 Stock Average", "💰 SIP", "📊 CAGR",
+        "🧾 Capital Gains", "🏦 Brokerage", "🏛️ FD",
+        "🏗️ DCF", "🔄 Reverse DCF",
+    ])
+
+    # ── TAB 1 — Stock Average Calculator ────────────────────────────────────
+    with calc1:
+        st.markdown("#### Average price across single or multiple purchases")
+        st.caption("Add each buy lot (quantity + price). The average, total qty and total invested update live.")
+
+        default_lots = pd.DataFrame(
+            [{"Quantity": 10, "Price (₹)": 100.0}, {"Quantity": 10, "Price (₹)": 120.0}]
+        )
+        lots = st.data_editor(
+            default_lots, num_rows="dynamic", use_container_width=True,
+            key="sa_lots",
+            column_config={
+                "Quantity":   st.column_config.NumberColumn(min_value=0, step=1, format="%d"),
+                "Price (₹)":  st.column_config.NumberColumn(min_value=0.0, step=0.05, format="%.2f"),
+            },
+        )
+        lots = lots.dropna()
+        lots = lots[(lots["Quantity"] > 0) & (lots["Price (₹)"] > 0)]
+
+        if lots.empty:
+            st.info("Add at least one buy lot above to see the average.")
+        else:
+            total_qty = float(lots["Quantity"].sum())
+            total_inv = float((lots["Quantity"] * lots["Price (₹)"]).sum())
+            avg_price = total_inv / total_qty if total_qty else 0.0
+
+            sa1, sa2, sa3 = st.columns(3)
+            _metric(sa1, f"{total_qty:,.0f}", "Total quantity")
+            _metric(sa2, f"₹{total_inv:,.2f}", "Total invested")
+            _metric(sa3, f"₹{avg_price:,.2f}", "Average price")
+
+            st.markdown("---")
+            st.markdown("##### 🎯 What if I buy more to bring the average down?")
+            tgt1, tgt2 = st.columns(2)
+            add_price = tgt1.number_input("Price of additional buy (₹)", min_value=0.0, value=max(avg_price - 10, 0.0), step=0.5, key="sa_add_price")
+            target_avg = tgt2.number_input("Target average price (₹)", min_value=0.0, value=max(avg_price - 5, 0.0), step=0.5, key="sa_target_avg")
+            if add_price >= target_avg or target_avg <= 0:
+                st.caption("Set an additional-buy price below your target average to compute the quantity needed.")
+            else:
+                qty_needed = (total_qty * (avg_price - target_avg)) / (target_avg - add_price)
+                if qty_needed > 0:
+                    st.success(f"Buy **{qty_needed:,.0f}** more shares at ₹{add_price:,.2f} to bring your average down to ≈ ₹{target_avg:,.2f}.")
+                else:
+                    st.info("Your average is already at or below that target.")
+
+    # ── TAB 2 — SIP Calculator ───────────────────────────────────────────────
+    with calc2:
+        st.markdown("#### Systematic Investment Plan (SIP) future value")
+        s1, s2, s3 = st.columns(3)
+        sip_amt   = s1.number_input("Monthly investment (₹)", min_value=100.0, value=10000.0, step=500.0, key="sip_amt")
+        sip_ret   = s2.number_input("Expected annual return (%)", min_value=0.0, value=12.0, step=0.5, key="sip_ret")
+        sip_years = s3.number_input("Tenure (years)", min_value=1, value=10, step=1, key="sip_years")
+
+        r_m = sip_ret / 100 / 12
+        n_m = int(sip_years * 12)
+        fv  = sip_amt * (((1 + r_m) ** n_m - 1) / r_m) * (1 + r_m) if r_m > 0 else sip_amt * n_m
+        invested = sip_amt * n_m
+        gain = fv - invested
+
+        r1, r2, r3 = st.columns(3)
+        _metric(r1, f"₹{invested:,.0f}", "Total invested")
+        _metric(r2, f"₹{gain:,.0f}",     "Wealth gained")
+        _metric(r3, f"₹{fv:,.0f}",       "Maturity value")
+
+        yearly = []
+        bal = 0.0
+        for m in range(1, n_m + 1):
+            bal = (bal + sip_amt) * (1 + r_m) if r_m > 0 else bal + sip_amt
+            if m % 12 == 0:
+                yearly.append({"Year": m // 12, "Invested": sip_amt * m, "Value": bal})
+        if yearly:
+            yr_df = pd.DataFrame(yearly)
+            fig_sip = go.Figure()
+            fig_sip.add_trace(go.Scatter(x=yr_df["Year"], y=yr_df["Invested"], name="Invested", line=dict(color=INK_MUTED, dash="dot")))
+            fig_sip.add_trace(go.Scatter(x=yr_df["Year"], y=yr_df["Value"], name="Value", line=dict(color=ACCENT, width=3), fill="tonexty"))
+            fig_sip.update_layout(xaxis_title="Year", yaxis_title="₹")
+            st.plotly_chart(_plotly_defaults(fig_sip, height=340), use_container_width=True)
+        st.caption("Assumes a fixed monthly return and consistent contributions — actual market returns will vary.")
+
+    # ── TAB 3 — CAGR Calculator ──────────────────────────────────────────────
+    with calc3:
+        st.markdown("#### Compound Annual Growth Rate (CAGR)")
+        c1, c2, c3 = st.columns(3)
+        cagr_begin = c1.number_input("Initial value (₹)", min_value=0.01, value=100000.0, step=1000.0, key="cagr_begin")
+        cagr_end   = c2.number_input("Final value (₹)",   min_value=0.01, value=180000.0, step=1000.0, key="cagr_end")
+        cagr_yrs   = c3.number_input("Duration (years)",  min_value=0.1,  value=5.0,      step=0.5,    key="cagr_yrs")
+
+        cagr_pct = ((cagr_end / cagr_begin) ** (1 / cagr_yrs) - 1) * 100 if cagr_begin > 0 and cagr_yrs > 0 else 0.0
+        abs_gain_pct = ((cagr_end - cagr_begin) / cagr_begin) * 100 if cagr_begin > 0 else 0.0
+
+        g1, g2 = st.columns(2)
+        _metric(g1, f"{cagr_pct:,.2f}%", "CAGR")
+        _metric(g2, f"{abs_gain_pct:,.2f}%", "Absolute gain")
+        st.caption("CAGR = (Final / Initial)^(1 / years) − 1. Smooths out year-to-year volatility into a single annualised rate.")
+
+    # ── TAB 4 — Capital Gains (LTCG / STCG) ─────────────────────────────────
+    with calc4:
+        st.markdown("#### Capital gains on listed equity / equity mutual funds (India)")
+        st.caption("Tax rates below are pre-filled with current defaults but editable — always confirm against the latest Finance Act before relying on this for filing.")
+        cg1, cg2, cg3 = st.columns(3)
+        cg_buy  = cg1.number_input("Buy price (₹)",  min_value=0.0, value=100.0, step=1.0, key="cg_buy")
+        cg_sell = cg2.number_input("Sell price (₹)", min_value=0.0, value=150.0, step=1.0, key="cg_sell")
+        cg_qty  = cg3.number_input("Quantity", min_value=1, value=100, step=1, key="cg_qty")
+        cg_hold = st.radio("Holding period", ["Short-term (< 12 months)", "Long-term (≥ 12 months)"], horizontal=True, key="cg_hold")
+
+        with st.expander("⚙️ Tax rate assumptions (editable)"):
+            e1, e2 = st.columns(2)
+            stcg_rate = e1.number_input("STCG rate (%)", min_value=0.0, value=20.0, step=0.5, key="cg_stcg_rate")
+            ltcg_rate = e2.number_input("LTCG rate (%)", min_value=0.0, value=12.5, step=0.5, key="cg_ltcg_rate")
+            ltcg_exempt = st.number_input("LTCG exemption per FY (₹)", min_value=0.0, value=125000.0, step=5000.0, key="cg_ltcg_exempt")
+
+        gross_gain = (cg_sell - cg_buy) * cg_qty
+        if gross_gain <= 0:
+            st.warning(f"No capital gains tax applies — this position shows a loss of ₹{abs(gross_gain):,.2f}.")
+        elif cg_hold.startswith("Short"):
+            tax = gross_gain * stcg_rate / 100
+            n1, n2, n3 = st.columns(3)
+            _metric(n1, f"₹{gross_gain:,.2f}", "Gross gain")
+            _metric(n2, f"₹{tax:,.2f}", f"STCG tax @ {stcg_rate:g}%")
+            _metric(n3, f"₹{gross_gain - tax:,.2f}", "Net gain after tax")
+        else:
+            taxable = max(gross_gain - ltcg_exempt, 0)
+            tax = taxable * ltcg_rate / 100
+            n1, n2, n3 = st.columns(3)
+            _metric(n1, f"₹{gross_gain:,.2f}", "Gross gain")
+            _metric(n2, f"₹{tax:,.2f}", f"LTCG tax @ {ltcg_rate:g}% (after ₹{ltcg_exempt:,.0f} exempt)")
+            _metric(n3, f"₹{gross_gain - tax:,.2f}", "Net gain after tax")
+
+    # ── TAB 5 — Brokerage & Break-even Calculator ────────────────────────────
+    with calc5:
+        st.markdown("#### Brokerage, charges &amp; break-even price")
+        b1, b2, b3 = st.columns(3)
+        br_buy  = b1.number_input("Buy price (₹)",  min_value=0.0, value=100.0, step=1.0, key="br_buy")
+        br_sell = b2.number_input("Sell price (₹)", min_value=0.0, value=105.0, step=1.0, key="br_sell")
+        br_qty  = b3.number_input("Quantity", min_value=1, value=100, step=1, key="br_qty")
+
+        with st.expander("⚙️ Charges assumptions (editable — delivery trade defaults)"):
+            x1, x2, x3 = st.columns(3)
+            brok_pct   = x1.number_input("Brokerage (% per side)", min_value=0.0, value=0.0, step=0.01, key="br_brok_pct", help="Many discount brokers charge ₹0–20 flat per order instead — set to 0 and adjust below if so.")
+            brok_flat  = x2.number_input("Flat fee per order (₹)", min_value=0.0, value=0.0, step=1.0, key="br_brok_flat")
+            stt_pct    = x3.number_input("STT (% on sell side)", min_value=0.0, value=0.1, step=0.01, key="br_stt_pct")
+            y1, y2 = st.columns(2)
+            other_pct  = y1.number_input("Other charges — exchange/DP/GST/stamp (% per side)", min_value=0.0, value=0.05, step=0.01, key="br_other_pct")
+
+        buy_val  = br_buy * br_qty
+        sell_val = br_sell * br_qty
+        charges  = (
+            (buy_val + sell_val) * brok_pct / 100 + 2 * brok_flat
+            + sell_val * stt_pct / 100
+            + (buy_val + sell_val) * other_pct / 100
+        )
+        gross_pnl = sell_val - buy_val
+        net_pnl   = gross_pnl - charges
+        breakeven = (buy_val + charges) / br_qty if br_qty else 0.0
+
+        p1, p2, p3, p4 = st.columns(4)
+        _metric(p1, f"₹{gross_pnl:,.2f}", "Gross P&L")
+        _metric(p2, f"₹{charges:,.2f}",   "Total charges")
+        _metric(p3, f"₹{net_pnl:,.2f}",   "Net P&L")
+        _metric(p4, f"₹{breakeven:,.2f}", "Break-even price")
+
+    # ── TAB 6 — Fixed Deposit Calculator ─────────────────────────────────────
+    with calc6:
+        st.markdown("#### Fixed Deposit maturity value")
+        f1, f2, f3, f4 = st.columns(4)
+        fd_principal = f1.number_input("Principal (₹)", min_value=0.0, value=100000.0, step=5000.0, key="fd_principal")
+        fd_rate      = f2.number_input("Interest rate (% p.a.)", min_value=0.0, value=7.0, step=0.1, key="fd_rate")
+        fd_years     = f3.number_input("Tenure (years)", min_value=0.1, value=5.0, step=0.5, key="fd_years")
+        fd_comp      = f4.selectbox("Compounding", ["Quarterly", "Monthly", "Half-yearly", "Annually"], key="fd_comp")
+
+        comp_map = {"Quarterly": 4, "Monthly": 12, "Half-yearly": 2, "Annually": 1}
+        n_freq = comp_map[fd_comp]
+        fd_maturity = fd_principal * (1 + (fd_rate / 100) / n_freq) ** (n_freq * fd_years)
+        fd_interest = fd_maturity - fd_principal
+
+        d1, d2 = st.columns(2)
+        _metric(d1, f"₹{fd_interest:,.2f}", "Interest earned")
+        _metric(d2, f"₹{fd_maturity:,.2f}", "Maturity value")
+        st.caption("Standard compound-interest FD math — actual bank payout may differ slightly by day-count convention.")
+
+    # ── shared DCF math (used by both DCF tabs) ──────────────────────────────
+    def _dcf_core(base_fcf, g1, n1, g_t, r, net_debt, shares):
+        """Two-stage DCF: explicit growth g1 for n1 years, then Gordon-growth terminal value."""
+        n1 = int(n1)
+        fcf_list = [base_fcf * (1 + g1) ** t for t in range(1, n1 + 1)]
+        pv_list  = [fcf / (1 + r) ** t for t, fcf in zip(range(1, n1 + 1), fcf_list)]
+        if r <= g_t:
+            return None
+        terminal_value = fcf_list[-1] * (1 + g_t) / (r - g_t)
+        pv_terminal = terminal_value / (1 + r) ** n1
+        ev = sum(pv_list) + pv_terminal
+        equity_value = ev - net_debt
+        per_share = equity_value / shares if shares else 0.0
+        return {
+            "fcf_list": fcf_list, "pv_list": pv_list, "terminal_value": terminal_value,
+            "pv_terminal": pv_terminal, "ev": ev, "equity_value": equity_value, "per_share": per_share,
+        }
+
+    # ── TAB 7 — DCF Calculator ────────────────────────────────────────────────
+    with calc7:
+        st.markdown("#### Discounted Cash Flow — intrinsic value per share")
+        st.caption("Two-stage model: explicit growth for N years, then a Gordon-growth terminal value discounted back at WACC.")
+
+        dc1, dc2, dc3 = st.columns(3)
+        dcf_fcf    = dc1.number_input("Base FCF — last 12m (₹ Cr)", min_value=0.0, value=500.0, step=10.0, key="dcf_fcf")
+        dcf_shares = dc2.number_input("Shares outstanding (Cr)", min_value=0.01, value=50.0, step=1.0, key="dcf_shares")
+        dcf_debt   = dc3.number_input("Net debt (₹ Cr) — negative if net cash", value=200.0, step=10.0, key="dcf_debt")
+
+        dc4, dc5, dc6, dc7 = st.columns(4)
+        dcf_g1   = dc4.number_input("Growth rate, explicit period (%)", value=15.0, step=0.5, key="dcf_g1")
+        dcf_n1   = dc5.number_input("Explicit period (years)", min_value=1, max_value=20, value=10, step=1, key="dcf_n1")
+        dcf_gt   = dc6.number_input("Terminal growth rate (%)", value=4.0, step=0.25, key="dcf_gt")
+        dcf_wacc = dc7.number_input("Discount rate / WACC (%)", min_value=0.1, value=11.0, step=0.25, key="dcf_wacc")
+
+        dcf_cmp = st.number_input("Current market price (₹) — optional, for upside/downside", min_value=0.0, value=0.0, step=1.0, key="dcf_cmp")
+
+        if dcf_wacc <= dcf_gt:
+            st.error("Discount rate must be greater than the terminal growth rate — adjust the inputs above.")
+        else:
+            res = _dcf_core(dcf_fcf, dcf_g1/100, dcf_n1, dcf_gt/100, dcf_wacc/100, dcf_debt, dcf_shares)
+
+            m1, m2, m3, m4 = st.columns(4)
+            _metric(m1, f"₹{res['ev']:,.0f} Cr", "Enterprise value")
+            _metric(m2, f"₹{res['equity_value']:,.0f} Cr", "Equity value")
+            _metric(m3, f"₹{res['per_share']:,.2f}", "Intrinsic value / share")
+            if dcf_cmp > 0:
+                upside = (res["per_share"] - dcf_cmp) / dcf_cmp * 100
+                _metric(m4, f"{upside:+,.1f}%", f"vs CMP ₹{dcf_cmp:,.2f}")
+            else:
+                _metric(m4, f"{res['pv_terminal']/res['ev']*100:,.0f}%", "Value from terminal")
+
+            years = list(range(1, int(dcf_n1) + 1))
+            fig_dcf = go.Figure()
+            fig_dcf.add_trace(go.Bar(x=years, y=res["fcf_list"], name="Projected FCF", marker_color=INK_MUTED, opacity=0.55))
+            fig_dcf.add_trace(go.Bar(x=years, y=res["pv_list"], name="PV of FCF", marker_color=ACCENT))
+            fig_dcf.update_layout(xaxis_title="Year", yaxis_title="₹ Cr", barmode="overlay")
+            st.plotly_chart(_plotly_defaults(fig_dcf, height=340), use_container_width=True)
+
+            fig_bridge = px.pie(
+                names=["PV of explicit-period FCF", "PV of terminal value"],
+                values=[sum(res["pv_list"]), res["pv_terminal"]],
+                hole=0.55, color_discrete_sequence=[ACCENT, "#adb5bd"], height=320,
+            )
+            fig_bridge.update_traces(textposition="inside", textinfo="percent+label")
+            fig_bridge.update_layout(font_family="IBM Plex Sans", margin=dict(l=0,r=0,t=20,b=0), showlegend=False)
+            bc1, bc2 = st.columns([1,1])
+            with bc1:
+                st.plotly_chart(fig_bridge, use_container_width=True)
+            with bc2:
+                st.markdown("##### Composition of enterprise value")
+                st.dataframe(pd.DataFrame({
+                    "Component": ["PV — explicit period", "PV — terminal value", "Enterprise value"],
+                    "₹ Cr": [round(sum(res["pv_list"]),1), round(res["pv_terminal"],1), round(res["ev"],1)],
+                }), hide_index=True, use_container_width=True)
+            st.caption("Terminal value = FCF in final explicit year × (1 + terminal growth) / (WACC − terminal growth), then discounted back N years.")
+
+    # ── TAB 8 — Reverse DCF Calculator ───────────────────────────────────────
+    with calc8:
+        st.markdown("#### Reverse DCF — what growth is the market pricing in?")
+        st.caption("Holds price, WACC and terminal growth fixed, and solves for the explicit-period growth rate that justifies today's price.")
+
+        rc1, rc2, rc3 = st.columns(3)
+        rdcf_cmp    = rc1.number_input("Current market price (₹)", min_value=0.01, value=800.0, step=1.0, key="rdcf_cmp")
+        rdcf_shares = rc2.number_input("Shares outstanding (Cr)", min_value=0.01, value=50.0, step=1.0, key="rdcf_shares")
+        rdcf_debt   = rc3.number_input("Net debt (₹ Cr) — negative if net cash", value=200.0, step=10.0, key="rdcf_debt")
+
+        rc4, rc5, rc6, rc7 = st.columns(4)
+        rdcf_fcf  = rc4.number_input("Base FCF — last 12m (₹ Cr)", min_value=0.01, value=500.0, step=10.0, key="rdcf_fcf")
+        rdcf_n1   = rc5.number_input("Explicit period (years)", min_value=1, max_value=20, value=10, step=1, key="rdcf_n1")
+        rdcf_gt   = rc6.number_input("Terminal growth rate (%)", value=4.0, step=0.25, key="rdcf_gt")
+        rdcf_wacc = rc7.number_input("Discount rate / WACC (%)", min_value=0.1, value=11.0, step=0.25, key="rdcf_wacc")
+
+        if rdcf_wacc <= rdcf_gt:
+            st.error("Discount rate must be greater than the terminal growth rate — adjust the inputs above.")
+        else:
+            r_dec, gt_dec = rdcf_wacc/100, rdcf_gt/100
+            target = rdcf_cmp
+
+            def _ps(g1):
+                out = _dcf_core(rdcf_fcf, g1, rdcf_n1, gt_dec, r_dec, rdcf_debt, rdcf_shares)
+                return out["per_share"] if out else float("-inf")
+
+            lo, hi = -0.50, 3.00
+            if _ps(lo) > target:
+                st.warning("Even a −50% growth assumption exceeds today's price — the market may be pricing in a decline steeper than this model's range.")
+            elif _ps(hi) < target:
+                st.warning("Even 300% growth doesn't reach today's price with these WACC/terminal assumptions — try lowering WACC or raising terminal growth.")
+            else:
+                for _ in range(60):
+                    mid = (lo + hi) / 2
+                    if _ps(mid) < target:
+                        lo = mid
+                    else:
+                        hi = mid
+                implied_g = (lo + hi) / 2
+
+                m1, m2 = st.columns(2)
+                _metric(m1, f"{implied_g*100:,.2f}%", "Implied growth rate (explicit period)")
+                _metric(m2, f"₹{_ps(implied_g):,.2f}", "Model price at that growth")
+
+                g_range = [x/1000 for x in range(-500, 1010, 10)]
+                px_vals = [_ps(g) for g in g_range]
+                fig_rev = go.Figure()
+                fig_rev.add_trace(go.Scatter(x=[g*100 for g in g_range], y=px_vals, name="Intrinsic value", line=dict(color=ACCENT, width=3)))
+                fig_rev.add_hline(y=rdcf_cmp, line_dash="dot", line_color=DANGER,
+                                   annotation_text=f"CMP ₹{rdcf_cmp:,.0f}", annotation_position="top left")
+                fig_rev.add_vline(x=implied_g*100, line_dash="dot", line_color=INK_MUTED)
+                fig_rev.add_trace(go.Scatter(x=[implied_g*100], y=[rdcf_cmp], mode="markers",
+                                              marker=dict(color=DANGER, size=10), name="Implied growth"))
+                fig_rev.update_layout(xaxis_title="Assumed explicit-period growth rate (%)", yaxis_title="Intrinsic value / share (₹)")
+                st.plotly_chart(_plotly_defaults(fig_rev, height=360), use_container_width=True)
+                st.caption("Where the blue curve crosses the current market price is the growth rate the market is implicitly assuming.")
+
+    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+    st.caption("These calculators are for quick estimation only and are not tax, investment or financial advice .")
+
+
 elif page == "My Activity":
 
     st.markdown(f"""<div class="page-head">
