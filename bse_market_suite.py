@@ -509,8 +509,8 @@ with st.sidebar:
     page = option_menu(
         menu_title="Dashboard",
         menu_icon="display",
-        options=["Announcements", "Charts", "Insights", "My Activity"],
-        icons=["file-earmark-text", "bar-chart-line", "lightbulb", "clock-history"],
+        options=["Announcements", "Charts", "Insights", "Calculators", "My Activity"],
+        icons=["file-earmark-text", "bar-chart-line", "lightbulb", "calculator", "clock-history"],
         default_index=0,
         styles={
             "container":      {"padding":"0.9rem 0.8rem","background-color":SURFACE,"border-radius":"14px","box-shadow":SHADOW_MD},
@@ -1198,6 +1198,548 @@ def render_idea_board(db_path: str):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  TRACKER  (embedded from app.py, scoped to BSE Equity)
+#
+#  Search + one-click Overview + a status/notes tracker + a starred Watchlist
+#  on top of the SAME bse_equity.db used elsewhere in this app
+#  (DB_PATHS["BSE Equity"]). Adds three of its own tables (announcement_notes /
+#  announcement_status / watchlist) the first time it runs, IF NOT EXISTS.
+#  All keys/functions are prefixed trk_ / _trk_ to avoid clashing with the
+#  rest of the dashboard.
+# ═════════════════════════════════════════════════════════════════════════════
+
+TRK_STATUS_OPTIONS = ["New", "Watching", "Important", "Actioned", "Ignored"]
+
+
+def _trk_conn(db_path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _trk_init_db(db_path: str):
+    """Creates the tracker's own tables (notes / status / watchlist) if they
+    don't exist yet. Doesn't touch announcements / idea tables — those are
+    owned by market_announcements.py and announcement_ideas_pipeline.py."""
+    conn = _trk_conn(db_path)
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS announcement_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                announcement_id INTEGER NOT NULL,
+                note TEXT NOT NULL,
+                created_at TEXT DEFAULT (datetime('now', 'localtime')),
+                FOREIGN KEY(announcement_id) REFERENCES announcements(id)
+            );
+            CREATE TABLE IF NOT EXISTS announcement_status (
+                announcement_id INTEGER PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'New',
+                updated_at TEXT DEFAULT (datetime('now', 'localtime')),
+                FOREIGN KEY(announcement_id) REFERENCES announcements(id)
+            );
+            CREATE TABLE IF NOT EXISTS watchlist (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                announcement_id INTEGER NOT NULL UNIQUE,
+                company_name TEXT,
+                symbol TEXT,
+                scrip_code TEXT,
+                subject TEXT,
+                target_price REAL,
+                remarks TEXT,
+                status TEXT NOT NULL DEFAULT 'Active',
+                added_at TEXT DEFAULT (datetime('now', 'localtime')),
+                FOREIGN KEY(announcement_id) REFERENCES announcements(id)
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _trk_run_query(db_path: str, sql: str, params: tuple = ()) -> pd.DataFrame:
+    conn = _trk_conn(db_path)
+    try:
+        df = pd.read_sql_query(sql, conn, params=params)
+    finally:
+        conn.close()
+    return df
+
+
+def _trk_execute(db_path: str, sql: str, params: tuple = ()):
+    conn = _trk_conn(db_path)
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _trk_delete_announcement(db_path: str, ann_id: int):
+    """Cascading delete: removes the announcement and everything that
+    references it (idea scores, notes, status, watchlist entry)."""
+    conn = _trk_conn(db_path)
+    try:
+        conn.execute("DELETE FROM announcement_idea_scores WHERE announcement_id = ?", (ann_id,))
+        conn.execute("DELETE FROM announcement_notes WHERE announcement_id = ?", (ann_id,))
+        conn.execute("DELETE FROM announcement_status WHERE announcement_id = ?", (ann_id,))
+        conn.execute("DELETE FROM watchlist WHERE announcement_id = ?", (ann_id,))
+        conn.execute("DELETE FROM announcements WHERE id = ?", (ann_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _trk_add_to_watchlist(db_path, ann_id, company_name, symbol, scrip_code, subject):
+    _trk_execute(
+        db_path,
+        """INSERT INTO watchlist (announcement_id, company_name, symbol, scrip_code, subject)
+           VALUES (?, ?, ?, ?, ?)
+           ON CONFLICT(announcement_id) DO NOTHING""",
+        (ann_id, company_name, symbol, scrip_code, subject),
+    )
+
+
+def _trk_remove_from_watchlist(db_path, ann_id):
+    _trk_execute(db_path, "DELETE FROM watchlist WHERE announcement_id = ?", (ann_id,))
+
+
+def _trk_get_watchlist_ids(db_path) -> set:
+    try:
+        df = _trk_run_query(db_path, "SELECT announcement_id FROM watchlist")
+        return set(df["announcement_id"].tolist())
+    except Exception:
+        return set()
+
+
+def _trk_get_categories(db_path):
+    try:
+        return _trk_run_query(db_path, "SELECT id, name FROM categories ORDER BY name")
+    except Exception:
+        return pd.DataFrame(columns=["id", "name"])
+
+
+def _trk_get_idea_types(db_path):
+    try:
+        return _trk_run_query(
+            db_path,
+            """SELECT it.id, it.name, g.name AS group_name
+               FROM idea_types it JOIN idea_groups g ON g.id = it.group_id
+               ORDER BY g.sort_order, it.sort_order""",
+        )
+    except Exception:
+        return pd.DataFrame(columns=["id", "name", "group_name"])
+
+
+def _trk_get_status_map(db_path):
+    try:
+        df = _trk_run_query(db_path, "SELECT announcement_id, status FROM announcement_status")
+        return dict(zip(df["announcement_id"], df["status"]))
+    except Exception:
+        return {}
+
+
+def _trk_get_note_counts(db_path):
+    try:
+        df = _trk_run_query(
+            db_path,
+            "SELECT announcement_id, COUNT(*) AS n FROM announcement_notes GROUP BY announcement_id",
+        )
+        return dict(zip(df["announcement_id"], df["n"]))
+    except Exception:
+        return {}
+
+
+def _trk_go_to_overview(ann_id: int):
+    st.session_state.trk_selected_id = ann_id
+    st.session_state.trk_view = "overview"
+
+
+def _trk_go_to_search():
+    st.session_state.trk_view = "search"
+    st.session_state.trk_confirm_delete_id = None
+
+
+def _trk_go_to_watchlist():
+    st.session_state.trk_view = "watchlist"
+
+
+def _trk_ask_confirm_delete(ann_id: int):
+    st.session_state.trk_confirm_delete_id = ann_id
+
+
+def _trk_cancel_delete():
+    st.session_state.trk_confirm_delete_id = None
+
+
+def _trk_do_delete(db_path, ann_id: int):
+    _trk_delete_announcement(db_path, ann_id)
+    st.session_state.trk_confirm_delete_id = None
+    if st.session_state.trk_selected_id == ann_id:
+        st.session_state.trk_selected_id = None
+        st.session_state.trk_view = "search"
+
+
+def _trk_do_toggle_watchlist(db_path, ann_id, in_wl, company_name, symbol, scrip_code, subject):
+    if in_wl:
+        _trk_remove_from_watchlist(db_path, ann_id)
+    else:
+        _trk_add_to_watchlist(db_path, ann_id, company_name, symbol, scrip_code, subject)
+
+
+def trk_render_search_page(db_path: str):
+    categories_df = _trk_get_categories(db_path)
+    idea_types_df = _trk_get_idea_types(db_path)
+
+    with st.form("trk_search_form"):
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            keyword = st.text_input(
+                "Search (company, symbol, scrip code, or subject)",
+                placeholder="e.g. Reliance, RELIANCE, 500325, buyback...",
+                key="trk_kw",
+            )
+        with c2:
+            category_name = st.selectbox(
+                "Category", options=["Any"] + categories_df["name"].tolist(), key="trk_cat",
+            )
+        with c3:
+            status_filter = st.selectbox("Status", options=["Any"] + TRK_STATUS_OPTIONS, key="trk_status_f")
+
+        c4, c5, c6 = st.columns([1, 1, 1])
+        with c4:
+            date_from = st.date_input("From date", value=None, format="YYYY-MM-DD", key="trk_from")
+        with c5:
+            date_to = st.date_input("To date", value=None, format="YYYY-MM-DD", key="trk_to")
+        with c6:
+            limit = st.number_input("Max results", min_value=10, max_value=5000, value=200, step=10, key="trk_limit")
+
+        with st.expander("Idea / signal filters (optional)"):
+            ic1, ic2 = st.columns([2, 1])
+            with ic1:
+                idea_labels = (idea_types_df["group_name"] + " → " + idea_types_df["name"]).tolist()
+                idea_selection = st.multiselect("Idea types", options=idea_labels, key="trk_idea_sel")
+            with ic2:
+                min_score = st.number_input("Min score", value=0.0, step=0.5, key="trk_min_score")
+
+        st.form_submit_button("Search", type="primary", use_container_width=True)
+
+    where_clauses, params = [], []
+    joins = ""
+
+    if keyword:
+        where_clauses.append(
+            "(a.company_name LIKE ? OR a.symbol LIKE ? OR a.scrip_code LIKE ? OR a.subject LIKE ?)"
+        )
+        kw = f"%{keyword}%"
+        params.extend([kw, kw, kw, kw])
+
+    if category_name and category_name != "Any":
+        where_clauses.append("a.category = ?")
+        params.append(category_name)
+
+    if date_from:
+        where_clauses.append("substr(a.input_timestamp, 1, 10) >= ?")
+        params.append(date_from.strftime("%Y-%m-%d"))
+
+    if date_to:
+        where_clauses.append("substr(a.input_timestamp, 1, 10) <= ?")
+        params.append(date_to.strftime("%Y-%m-%d"))
+
+    if idea_selection:
+        idea_ids = idea_types_df[
+            (idea_types_df["group_name"] + " → " + idea_types_df["name"]).isin(idea_selection)
+        ]["id"].tolist()
+        joins = "JOIN announcement_idea_scores ais ON ais.announcement_id = a.id"
+        placeholders = ",".join(["?"] * len(idea_ids))
+        where_clauses.append(f"ais.idea_type_id IN ({placeholders})")
+        params.extend(idea_ids)
+        where_clauses.append("ais.score >= ?")
+        params.append(min_score)
+
+    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+    sql = f"""
+        SELECT DISTINCT a.id, a.company_name, a.symbol, a.scrip_code, a.category,
+               a.subcategory, a.subject, a.input_timestamp, a.file_name
+        FROM v_announcements a {joins}
+        {where_sql}
+        ORDER BY a.input_timestamp DESC
+        LIMIT ?
+    """
+    params.append(int(limit))
+
+    try:
+        results = _trk_run_query(db_path, sql, tuple(params))
+    except Exception as e:
+        st.error(f"Query failed: {e}")
+        return
+
+    status_map = _trk_get_status_map(db_path)
+    note_counts = _trk_get_note_counts(db_path)
+    watchlist_ids = _trk_get_watchlist_ids(db_path)
+
+    if status_filter != "Any":
+        wanted_ids = [k for k, v in status_map.items() if v == status_filter]
+        results = results[results["id"].isin(wanted_ids)]
+
+    st.caption(f"{len(results)} result(s)")
+
+    if results.empty:
+        st.info("No announcements match your search.")
+        return
+
+    hcols = st.columns([2.1, 1.0, 1.3, 3.1, 1.2, 0.9, 1.7])
+    for col, label in zip(
+        hcols, ["Company", "Symbol", "Category", "Subject", "Date/Time", "Status", "Actions"]
+    ):
+        col.markdown(f"**{label}**")
+    st.divider()
+
+    for _, row in results.iterrows():
+        ann_id = int(row["id"])
+        cols = st.columns([2.1, 1.0, 1.3, 3.1, 1.2, 0.9, 1.7])
+        cols[0].write(row["company_name"] or "—")
+        cols[1].write(row["symbol"] or (row["scrip_code"] or "—"))
+        cols[2].write(row["category"] or "—")
+        subject_txt = (row["subject"] or "").strip()
+        cols[3].write((subject_txt[:90] + "…") if len(subject_txt) > 90 else (subject_txt or "—"))
+        cols[4].write(row["input_timestamp"] or "—")
+
+        status_val = status_map.get(ann_id, "New")
+        note_n = note_counts.get(ann_id, 0)
+        badge = f":blue[{status_val}]" if status_val == "Watching" else (
+            f":red[{status_val}]" if status_val == "Important" else (
+                f":green[{status_val}]" if status_val == "Actioned" else (
+                    f":gray[{status_val}]"
+                )
+            )
+        )
+        note_suffix = f" 📝{note_n}" if note_n else ""
+        cols[5].markdown(f"{badge}{note_suffix}")
+
+        if st.session_state.trk_confirm_delete_id == ann_id:
+            with cols[6]:
+                wc1, wc2 = st.columns(2)
+                wc1.button(
+                    "✅ Confirm", key=f"trk_confirm_del_{ann_id}",
+                    on_click=_trk_do_delete, args=(db_path, ann_id), use_container_width=True,
+                )
+                wc2.button(
+                    "✖ Cancel", key=f"trk_cancel_del_{ann_id}",
+                    on_click=_trk_cancel_delete, use_container_width=True,
+                )
+        else:
+            in_wl = ann_id in watchlist_ids
+            with cols[6]:
+                ac1, ac2, ac3 = st.columns(3)
+                ac1.button(
+                    "👁️", key=f"trk_view_{ann_id}", help="Overview",
+                    on_click=_trk_go_to_overview, args=(ann_id,), use_container_width=True,
+                )
+                ac2.button(
+                    "🗑️", key=f"trk_del_{ann_id}", help="Delete this announcement",
+                    on_click=_trk_ask_confirm_delete, args=(ann_id,), use_container_width=True,
+                )
+                ac3.button(
+                    "⭐" if not in_wl else "★",
+                    key=f"trk_wl_{ann_id}",
+                    help="Remove from Watchlist" if in_wl else "Add to Watchlist",
+                    on_click=_trk_do_toggle_watchlist,
+                    args=(db_path, ann_id, in_wl, row["company_name"], row["symbol"], row["scrip_code"], row["subject"]),
+                    use_container_width=True,
+                )
+        st.divider()
+
+
+def trk_render_overview_page(db_path: str):
+    ann_id = st.session_state.trk_selected_id
+    st.button("← Back to search", on_click=_trk_go_to_search, key="trk_back_btn")
+
+    ann_df = _trk_run_query(db_path, "SELECT * FROM v_announcements WHERE id = ?", (ann_id,))
+    if ann_df.empty:
+        st.error("Announcement not found.")
+        return
+    ann = ann_df.iloc[0]
+
+    st.subheader(ann["company_name"] or "Unknown company")
+    sub_cols = st.columns([1, 1, 1, 1])
+    sub_cols[0].metric("Symbol", ann["symbol"] or "—")
+    sub_cols[1].metric("Scrip code", ann["scrip_code"] or "—")
+    sub_cols[2].metric("Category", ann["category"] or "—")
+    sub_cols[3].metric("Subcategory", ann["subcategory"] or "—")
+
+    st.markdown("**Subject**")
+    st.write(ann["subject"] or "—")
+
+    meta_cols = st.columns(2)
+    meta_cols[0].write(f"**Filed:** {ann['input_timestamp'] or '—'}")
+    meta_cols[1].write(f"**Fetched at:** {ann['fetched_at'] if 'fetched_at' in ann else '—'}")
+
+    file_name = ann["file_name"] if "file_name" in ann else None
+    if file_name:
+        st.link_button("📎 Open attachment / PDF", f"{BSE_ATTACH_BASE}{file_name}")
+
+    idea_df = _trk_run_query(
+        db_path,
+        """SELECT g.name AS idea_group, t.name AS idea_type, s.score, s.matched_keywords
+           FROM announcement_idea_scores s
+           JOIN idea_types t ON t.id = s.idea_type_id
+           JOIN idea_groups g ON g.id = t.group_id
+           WHERE s.announcement_id = ?
+           ORDER BY s.score DESC""",
+        (ann_id,),
+    )
+    if not idea_df.empty:
+        st.markdown("**Idea signal scores**")
+        st.dataframe(idea_df, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    st.markdown("**📌 Status**")
+    cur_status_df = _trk_run_query(
+        db_path, "SELECT status FROM announcement_status WHERE announcement_id = ?", (ann_id,)
+    )
+    cur_status = cur_status_df.iloc[0]["status"] if not cur_status_df.empty else "New"
+
+    sc1, sc2 = st.columns([2, 1])
+    with sc1:
+        new_status = st.selectbox(
+            "Track this announcement as",
+            TRK_STATUS_OPTIONS,
+            index=TRK_STATUS_OPTIONS.index(cur_status) if cur_status in TRK_STATUS_OPTIONS else 0,
+            key=f"trk_status_sel_{ann_id}",
+        )
+    with sc2:
+        st.write("")
+        st.write("")
+        if st.button("Save status", use_container_width=True, key=f"trk_save_status_{ann_id}"):
+            _trk_execute(
+                db_path,
+                """INSERT INTO announcement_status (announcement_id, status, updated_at)
+                   VALUES (?, ?, datetime('now','localtime'))
+                   ON CONFLICT(announcement_id) DO UPDATE SET
+                       status=excluded.status, updated_at=excluded.updated_at""",
+                (ann_id, new_status),
+            )
+            st.success(f"Status set to '{new_status}'")
+            st.rerun()
+
+    st.divider()
+
+    st.markdown("**📝 Notes**")
+    with st.form(f"trk_note_form_{ann_id}", clear_on_submit=True):
+        new_note = st.text_area("Add a note", placeholder="Type a quick note about this announcement...")
+        add_clicked = st.form_submit_button("Add note", type="primary")
+    if add_clicked and new_note.strip():
+        _trk_execute(
+            db_path,
+            "INSERT INTO announcement_notes (announcement_id, note) VALUES (?, ?)",
+            (ann_id, new_note.strip()),
+        )
+        st.rerun()
+
+    notes_df = _trk_run_query(
+        db_path,
+        "SELECT id, note, created_at FROM announcement_notes WHERE announcement_id = ? ORDER BY created_at DESC",
+        (ann_id,),
+    )
+    if notes_df.empty:
+        st.caption("No notes yet.")
+    else:
+        for _, n in notes_df.iterrows():
+            with st.container(border=True):
+                nc1, nc2 = st.columns([5, 1])
+                nc1.write(n["note"])
+                nc1.caption(n["created_at"])
+                if nc2.button("🗑️ Delete", key=f"trk_del_note_{n['id']}"):
+                    _trk_execute(db_path, "DELETE FROM announcement_notes WHERE id = ?", (int(n["id"]),))
+                    st.rerun()
+
+
+def trk_render_watchlist_page(db_path: str):
+    st.caption("Announcements you've flagged with the ⭐ icon, tracked separately from the raw feed.")
+
+    wl_df = _trk_run_query(db_path, "SELECT * FROM watchlist ORDER BY added_at DESC")
+
+    if wl_df.empty:
+        st.info("Nothing on your watchlist yet. Go to Search and tap ⭐ on an announcement to add it.")
+        return
+
+    for _, w in wl_df.iterrows():
+        wl_id = int(w["id"])
+        ann_id = int(w["announcement_id"])
+        with st.container(border=True):
+            top = st.columns([3, 1, 1, 1])
+            top[0].markdown(f"**{w['company_name'] or '—'}**  ({w['symbol'] or w['scrip_code'] or '—'})")
+            top[1].caption(f"Added: {w['added_at']}")
+            if top[2].button("Overview →", key=f"trk_wl_open_{wl_id}"):
+                _trk_go_to_overview(ann_id)
+                st.rerun()
+            if top[3].button("🗑️ Remove", key=f"trk_wl_remove_{wl_id}"):
+                _trk_remove_from_watchlist(db_path, ann_id)
+                st.rerun()
+
+            st.write(w["subject"] or "—")
+
+            with st.form(f"trk_wl_edit_{wl_id}"):
+                ec1, ec2, ec3 = st.columns([1, 1, 2])
+                target_price = ec1.number_input(
+                    "Target price", value=float(w["target_price"]) if w["target_price"] is not None else 0.0,
+                    step=0.5, key=f"trk_tp_{wl_id}",
+                )
+                wl_status = ec2.selectbox(
+                    "Status", ["Active", "Hit Target", "Closed"],
+                    index=["Active", "Hit Target", "Closed"].index(w["status"]) if w["status"] in ["Active", "Hit Target", "Closed"] else 0,
+                    key=f"trk_wst_{wl_id}",
+                )
+                remarks = ec3.text_input("Remarks", value=w["remarks"] or "", key=f"trk_rm_{wl_id}")
+                if st.form_submit_button("Save"):
+                    _trk_execute(
+                        db_path,
+                        "UPDATE watchlist SET target_price = ?, status = ?, remarks = ? WHERE id = ?",
+                        (target_price, wl_status, remarks, wl_id),
+                    )
+                    st.rerun()
+
+
+def render_tracker(db_path: str):
+    """Entry point for the embedded Tracker sub-tab — search, one-click
+    overview with status/notes, and a starred watchlist, all scoped to the
+    same BSE Equity database used by the Announcements and Idea Board tabs."""
+    st.session_state.setdefault("trk_view", "search")
+    st.session_state.setdefault("trk_selected_id", None)
+    st.session_state.setdefault("trk_confirm_delete_id", None)
+
+    try:
+        _trk_init_db(db_path)
+    except Exception as e:
+        st.error(f"Could not initialize tracker tables: {e}")
+        return
+
+    if st.session_state.trk_view != "overview":
+        nav1, nav2, _ = st.columns([1, 1, 4])
+        nav1.button(
+            "🔍 Search", use_container_width=True, key="trk_nav_search",
+            type="primary" if st.session_state.trk_view == "search" else "secondary",
+            on_click=_trk_go_to_search,
+        )
+        nav2.button(
+            "⭐ Watchlist", use_container_width=True, key="trk_nav_watchlist",
+            type="primary" if st.session_state.trk_view == "watchlist" else "secondary",
+            on_click=_trk_go_to_watchlist,
+        )
+        st.divider()
+
+    if st.session_state.trk_view == "overview" and st.session_state.trk_selected_id is not None:
+        trk_render_overview_page(db_path)
+    elif st.session_state.trk_view == "watchlist":
+        trk_render_watchlist_page(db_path)
+    else:
+        trk_render_search_page(db_path)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  PAGE: ANNOUNCEMENTS
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -1231,7 +1773,7 @@ if page == "Announcements":
     with t_be:
         _source_badge("BSE Equity")
 
-        be_sub_ann, be_sub_idb = st.tabs(["📋 Announcements", "💡 Idea Board"])
+        be_sub_ann, be_sub_idb, be_sub_trk = st.tabs(["📋 Announcements", "💡 Idea Board", "🗂️ Tracker"])
 
         with be_sub_ann:
             c = _conn("BSE Equity")
@@ -1275,6 +1817,9 @@ if page == "Announcements":
 
         with be_sub_idb:
             render_idea_board(DB_PATHS["BSE Equity"])
+
+        with be_sub_trk:
+            render_tracker(DB_PATHS["BSE Equity"])
 
     # ── BSE SME ───────────────────────────────────────────────────────────────
     with t_bs:
@@ -1802,6 +2347,336 @@ elif page == "Insights":
 # ═════════════════════════════════════════════════════════════════════════════
 #  PAGE: MY ACTIVITY
 # ═════════════════════════════════════════════════════════════════════════════
+
+elif page == "Calculators":
+
+    st.markdown("""<div class="page-head">
+      <h1>🧮 Calculators</h1>
+      <p>Quick-fire investing &amp; tax tools — stock average, SIP, CAGR, capital gains, brokerage, FD, DCF &amp; Reverse DCF</p>
+    </div>""", unsafe_allow_html=True)
+
+    calc1, calc2, calc3, calc4, calc5, calc6, calc7, calc8 = st.tabs([
+        "📈 Stock Average", "💰 SIP", "📊 CAGR",
+        "🧾 Capital Gains", "🏦 Brokerage", "🏛️ FD",
+        "🏗️ DCF", "🔄 Reverse DCF",
+    ])
+
+    # ── TAB 1 — Stock Average Calculator ────────────────────────────────────
+    with calc1:
+        st.markdown("#### Average price across single or multiple purchases")
+        st.caption("Add each buy lot (quantity + price). The average, total qty and total invested update live.")
+
+        default_lots = pd.DataFrame(
+            [{"Quantity": 10, "Price (₹)": 100.0}, {"Quantity": 10, "Price (₹)": 120.0}]
+        )
+        lots = st.data_editor(
+            default_lots, num_rows="dynamic", use_container_width=True,
+            key="sa_lots",
+            column_config={
+                "Quantity":   st.column_config.NumberColumn(min_value=0, step=1, format="%d"),
+                "Price (₹)":  st.column_config.NumberColumn(min_value=0.0, step=0.05, format="%.2f"),
+            },
+        )
+        lots = lots.dropna()
+        lots = lots[(lots["Quantity"] > 0) & (lots["Price (₹)"] > 0)]
+
+        if lots.empty:
+            st.info("Add at least one buy lot above to see the average.")
+        else:
+            total_qty = float(lots["Quantity"].sum())
+            total_inv = float((lots["Quantity"] * lots["Price (₹)"]).sum())
+            avg_price = total_inv / total_qty if total_qty else 0.0
+
+            sa1, sa2, sa3 = st.columns(3)
+            _metric(sa1, f"{total_qty:,.0f}", "Total quantity")
+            _metric(sa2, f"₹{total_inv:,.2f}", "Total invested")
+            _metric(sa3, f"₹{avg_price:,.2f}", "Average price")
+
+            st.markdown("---")
+            st.markdown("##### 🎯 What if I buy more to bring the average down?")
+            tgt1, tgt2 = st.columns(2)
+            add_price = tgt1.number_input("Price of additional buy (₹)", min_value=0.0, value=max(avg_price - 10, 0.0), step=0.5, key="sa_add_price")
+            target_avg = tgt2.number_input("Target average price (₹)", min_value=0.0, value=max(avg_price - 5, 0.0), step=0.5, key="sa_target_avg")
+            if add_price >= target_avg or target_avg <= 0:
+                st.caption("Set an additional-buy price below your target average to compute the quantity needed.")
+            else:
+                qty_needed = (total_qty * (avg_price - target_avg)) / (target_avg - add_price)
+                if qty_needed > 0:
+                    st.success(f"Buy **{qty_needed:,.0f}** more shares at ₹{add_price:,.2f} to bring your average down to ≈ ₹{target_avg:,.2f}.")
+                else:
+                    st.info("Your average is already at or below that target.")
+
+    # ── TAB 2 — SIP Calculator ───────────────────────────────────────────────
+    with calc2:
+        st.markdown("#### Systematic Investment Plan (SIP) future value")
+        s1, s2, s3 = st.columns(3)
+        sip_amt   = s1.number_input("Monthly investment (₹)", min_value=100.0, value=10000.0, step=500.0, key="sip_amt")
+        sip_ret   = s2.number_input("Expected annual return (%)", min_value=0.0, value=12.0, step=0.5, key="sip_ret")
+        sip_years = s3.number_input("Tenure (years)", min_value=1, value=10, step=1, key="sip_years")
+
+        r_m = sip_ret / 100 / 12
+        n_m = int(sip_years * 12)
+        fv  = sip_amt * (((1 + r_m) ** n_m - 1) / r_m) * (1 + r_m) if r_m > 0 else sip_amt * n_m
+        invested = sip_amt * n_m
+        gain = fv - invested
+
+        r1, r2, r3 = st.columns(3)
+        _metric(r1, f"₹{invested:,.0f}", "Total invested")
+        _metric(r2, f"₹{gain:,.0f}",     "Wealth gained")
+        _metric(r3, f"₹{fv:,.0f}",       "Maturity value")
+
+        yearly = []
+        bal = 0.0
+        for m in range(1, n_m + 1):
+            bal = (bal + sip_amt) * (1 + r_m) if r_m > 0 else bal + sip_amt
+            if m % 12 == 0:
+                yearly.append({"Year": m // 12, "Invested": sip_amt * m, "Value": bal})
+        if yearly:
+            yr_df = pd.DataFrame(yearly)
+            fig_sip = go.Figure()
+            fig_sip.add_trace(go.Scatter(x=yr_df["Year"], y=yr_df["Invested"], name="Invested", line=dict(color=INK_MUTED, dash="dot")))
+            fig_sip.add_trace(go.Scatter(x=yr_df["Year"], y=yr_df["Value"], name="Value", line=dict(color=ACCENT, width=3), fill="tonexty"))
+            fig_sip.update_layout(xaxis_title="Year", yaxis_title="₹")
+            st.plotly_chart(_plotly_defaults(fig_sip, height=340), use_container_width=True)
+        st.caption("Assumes a fixed monthly return and consistent contributions — actual market returns will vary.")
+
+    # ── TAB 3 — CAGR Calculator ──────────────────────────────────────────────
+    with calc3:
+        st.markdown("#### Compound Annual Growth Rate (CAGR)")
+        c1, c2, c3 = st.columns(3)
+        cagr_begin = c1.number_input("Initial value (₹)", min_value=0.01, value=100000.0, step=1000.0, key="cagr_begin")
+        cagr_end   = c2.number_input("Final value (₹)",   min_value=0.01, value=180000.0, step=1000.0, key="cagr_end")
+        cagr_yrs   = c3.number_input("Duration (years)",  min_value=0.1,  value=5.0,      step=0.5,    key="cagr_yrs")
+
+        cagr_pct = ((cagr_end / cagr_begin) ** (1 / cagr_yrs) - 1) * 100 if cagr_begin > 0 and cagr_yrs > 0 else 0.0
+        abs_gain_pct = ((cagr_end - cagr_begin) / cagr_begin) * 100 if cagr_begin > 0 else 0.0
+
+        g1, g2 = st.columns(2)
+        _metric(g1, f"{cagr_pct:,.2f}%", "CAGR")
+        _metric(g2, f"{abs_gain_pct:,.2f}%", "Absolute gain")
+        st.caption("CAGR = (Final / Initial)^(1 / years) − 1. Smooths out year-to-year volatility into a single annualised rate.")
+
+    # ── TAB 4 — Capital Gains (LTCG / STCG) ─────────────────────────────────
+    with calc4:
+        st.markdown("#### Capital gains on listed equity / equity mutual funds (India)")
+        st.caption("Tax rates below are pre-filled with current defaults but editable — always confirm against the latest Finance Act before relying on this for filing.")
+        cg1, cg2, cg3 = st.columns(3)
+        cg_buy  = cg1.number_input("Buy price (₹)",  min_value=0.0, value=100.0, step=1.0, key="cg_buy")
+        cg_sell = cg2.number_input("Sell price (₹)", min_value=0.0, value=150.0, step=1.0, key="cg_sell")
+        cg_qty  = cg3.number_input("Quantity", min_value=1, value=100, step=1, key="cg_qty")
+        cg_hold = st.radio("Holding period", ["Short-term (< 12 months)", "Long-term (≥ 12 months)"], horizontal=True, key="cg_hold")
+
+        with st.expander("⚙️ Tax rate assumptions (editable)"):
+            e1, e2 = st.columns(2)
+            stcg_rate = e1.number_input("STCG rate (%)", min_value=0.0, value=20.0, step=0.5, key="cg_stcg_rate")
+            ltcg_rate = e2.number_input("LTCG rate (%)", min_value=0.0, value=12.5, step=0.5, key="cg_ltcg_rate")
+            ltcg_exempt = st.number_input("LTCG exemption per FY (₹)", min_value=0.0, value=125000.0, step=5000.0, key="cg_ltcg_exempt")
+
+        gross_gain = (cg_sell - cg_buy) * cg_qty
+        if gross_gain <= 0:
+            st.warning(f"No capital gains tax applies — this position shows a loss of ₹{abs(gross_gain):,.2f}.")
+        elif cg_hold.startswith("Short"):
+            tax = gross_gain * stcg_rate / 100
+            n1, n2, n3 = st.columns(3)
+            _metric(n1, f"₹{gross_gain:,.2f}", "Gross gain")
+            _metric(n2, f"₹{tax:,.2f}", f"STCG tax @ {stcg_rate:g}%")
+            _metric(n3, f"₹{gross_gain - tax:,.2f}", "Net gain after tax")
+        else:
+            taxable = max(gross_gain - ltcg_exempt, 0)
+            tax = taxable * ltcg_rate / 100
+            n1, n2, n3 = st.columns(3)
+            _metric(n1, f"₹{gross_gain:,.2f}", "Gross gain")
+            _metric(n2, f"₹{tax:,.2f}", f"LTCG tax @ {ltcg_rate:g}% (after ₹{ltcg_exempt:,.0f} exempt)")
+            _metric(n3, f"₹{gross_gain - tax:,.2f}", "Net gain after tax")
+
+    # ── TAB 5 — Brokerage & Break-even Calculator ────────────────────────────
+    with calc5:
+        st.markdown("#### Brokerage, charges &amp; break-even price")
+        b1, b2, b3 = st.columns(3)
+        br_buy  = b1.number_input("Buy price (₹)",  min_value=0.0, value=100.0, step=1.0, key="br_buy")
+        br_sell = b2.number_input("Sell price (₹)", min_value=0.0, value=105.0, step=1.0, key="br_sell")
+        br_qty  = b3.number_input("Quantity", min_value=1, value=100, step=1, key="br_qty")
+
+        with st.expander("⚙️ Charges assumptions (editable — delivery trade defaults)"):
+            x1, x2, x3 = st.columns(3)
+            brok_pct   = x1.number_input("Brokerage (% per side)", min_value=0.0, value=0.0, step=0.01, key="br_brok_pct", help="Many discount brokers charge ₹0–20 flat per order instead — set to 0 and adjust below if so.")
+            brok_flat  = x2.number_input("Flat fee per order (₹)", min_value=0.0, value=0.0, step=1.0, key="br_brok_flat")
+            stt_pct    = x3.number_input("STT (% on sell side)", min_value=0.0, value=0.1, step=0.01, key="br_stt_pct")
+            y1, y2 = st.columns(2)
+            other_pct  = y1.number_input("Other charges — exchange/DP/GST/stamp (% per side)", min_value=0.0, value=0.05, step=0.01, key="br_other_pct")
+
+        buy_val  = br_buy * br_qty
+        sell_val = br_sell * br_qty
+        charges  = (
+            (buy_val + sell_val) * brok_pct / 100 + 2 * brok_flat
+            + sell_val * stt_pct / 100
+            + (buy_val + sell_val) * other_pct / 100
+        )
+        gross_pnl = sell_val - buy_val
+        net_pnl   = gross_pnl - charges
+        breakeven = (buy_val + charges) / br_qty if br_qty else 0.0
+
+        p1, p2, p3, p4 = st.columns(4)
+        _metric(p1, f"₹{gross_pnl:,.2f}", "Gross P&L")
+        _metric(p2, f"₹{charges:,.2f}",   "Total charges")
+        _metric(p3, f"₹{net_pnl:,.2f}",   "Net P&L")
+        _metric(p4, f"₹{breakeven:,.2f}", "Break-even price")
+
+    # ── TAB 6 — Fixed Deposit Calculator ─────────────────────────────────────
+    with calc6:
+        st.markdown("#### Fixed Deposit maturity value")
+        f1, f2, f3, f4 = st.columns(4)
+        fd_principal = f1.number_input("Principal (₹)", min_value=0.0, value=100000.0, step=5000.0, key="fd_principal")
+        fd_rate      = f2.number_input("Interest rate (% p.a.)", min_value=0.0, value=7.0, step=0.1, key="fd_rate")
+        fd_years     = f3.number_input("Tenure (years)", min_value=0.1, value=5.0, step=0.5, key="fd_years")
+        fd_comp      = f4.selectbox("Compounding", ["Quarterly", "Monthly", "Half-yearly", "Annually"], key="fd_comp")
+
+        comp_map = {"Quarterly": 4, "Monthly": 12, "Half-yearly": 2, "Annually": 1}
+        n_freq = comp_map[fd_comp]
+        fd_maturity = fd_principal * (1 + (fd_rate / 100) / n_freq) ** (n_freq * fd_years)
+        fd_interest = fd_maturity - fd_principal
+
+        d1, d2 = st.columns(2)
+        _metric(d1, f"₹{fd_interest:,.2f}", "Interest earned")
+        _metric(d2, f"₹{fd_maturity:,.2f}", "Maturity value")
+        st.caption("Standard compound-interest FD math — actual bank payout may differ slightly by day-count convention.")
+
+    # ── shared DCF math (used by both DCF tabs) ──────────────────────────────
+    def _dcf_core(base_fcf, g1, n1, g_t, r, net_debt, shares):
+        """Two-stage DCF: explicit growth g1 for n1 years, then Gordon-growth terminal value."""
+        n1 = int(n1)
+        fcf_list = [base_fcf * (1 + g1) ** t for t in range(1, n1 + 1)]
+        pv_list  = [fcf / (1 + r) ** t for t, fcf in zip(range(1, n1 + 1), fcf_list)]
+        if r <= g_t:
+            return None
+        terminal_value = fcf_list[-1] * (1 + g_t) / (r - g_t)
+        pv_terminal = terminal_value / (1 + r) ** n1
+        ev = sum(pv_list) + pv_terminal
+        equity_value = ev - net_debt
+        per_share = equity_value / shares if shares else 0.0
+        return {
+            "fcf_list": fcf_list, "pv_list": pv_list, "terminal_value": terminal_value,
+            "pv_terminal": pv_terminal, "ev": ev, "equity_value": equity_value, "per_share": per_share,
+        }
+
+    # ── TAB 7 — DCF Calculator ────────────────────────────────────────────────
+    with calc7:
+        st.markdown("#### Discounted Cash Flow — intrinsic value per share")
+        st.caption("Two-stage model: explicit growth for N years, then a Gordon-growth terminal value discounted back at WACC.")
+
+        dc1, dc2, dc3 = st.columns(3)
+        dcf_fcf    = dc1.number_input("Base FCF — last 12m (₹ Cr)", min_value=0.0, value=500.0, step=10.0, key="dcf_fcf")
+        dcf_shares = dc2.number_input("Shares outstanding (Cr)", min_value=0.01, value=50.0, step=1.0, key="dcf_shares")
+        dcf_debt   = dc3.number_input("Net debt (₹ Cr) — negative if net cash", value=200.0, step=10.0, key="dcf_debt")
+
+        dc4, dc5, dc6, dc7 = st.columns(4)
+        dcf_g1   = dc4.number_input("Growth rate, explicit period (%)", value=15.0, step=0.5, key="dcf_g1")
+        dcf_n1   = dc5.number_input("Explicit period (years)", min_value=1, max_value=20, value=10, step=1, key="dcf_n1")
+        dcf_gt   = dc6.number_input("Terminal growth rate (%)", value=4.0, step=0.25, key="dcf_gt")
+        dcf_wacc = dc7.number_input("Discount rate / WACC (%)", min_value=0.1, value=11.0, step=0.25, key="dcf_wacc")
+
+        dcf_cmp = st.number_input("Current market price (₹) — optional, for upside/downside", min_value=0.0, value=0.0, step=1.0, key="dcf_cmp")
+
+        if dcf_wacc <= dcf_gt:
+            st.error("Discount rate must be greater than the terminal growth rate — adjust the inputs above.")
+        else:
+            res = _dcf_core(dcf_fcf, dcf_g1/100, dcf_n1, dcf_gt/100, dcf_wacc/100, dcf_debt, dcf_shares)
+
+            m1, m2, m3, m4 = st.columns(4)
+            _metric(m1, f"₹{res['ev']:,.0f} Cr", "Enterprise value")
+            _metric(m2, f"₹{res['equity_value']:,.0f} Cr", "Equity value")
+            _metric(m3, f"₹{res['per_share']:,.2f}", "Intrinsic value / share")
+            if dcf_cmp > 0:
+                upside = (res["per_share"] - dcf_cmp) / dcf_cmp * 100
+                _metric(m4, f"{upside:+,.1f}%", f"vs CMP ₹{dcf_cmp:,.2f}")
+            else:
+                _metric(m4, f"{res['pv_terminal']/res['ev']*100:,.0f}%", "Value from terminal")
+
+            years = list(range(1, int(dcf_n1) + 1))
+            fig_dcf = go.Figure()
+            fig_dcf.add_trace(go.Bar(x=years, y=res["fcf_list"], name="Projected FCF", marker_color=INK_MUTED, opacity=0.55))
+            fig_dcf.add_trace(go.Bar(x=years, y=res["pv_list"], name="PV of FCF", marker_color=ACCENT))
+            fig_dcf.update_layout(xaxis_title="Year", yaxis_title="₹ Cr", barmode="overlay")
+            st.plotly_chart(_plotly_defaults(fig_dcf, height=340), use_container_width=True)
+
+            fig_bridge = px.pie(
+                names=["PV of explicit-period FCF", "PV of terminal value"],
+                values=[sum(res["pv_list"]), res["pv_terminal"]],
+                hole=0.55, color_discrete_sequence=[ACCENT, "#adb5bd"], height=320,
+            )
+            fig_bridge.update_traces(textposition="inside", textinfo="percent+label")
+            fig_bridge.update_layout(font_family="IBM Plex Sans", margin=dict(l=0,r=0,t=20,b=0), showlegend=False)
+            bc1, bc2 = st.columns([1,1])
+            with bc1:
+                st.plotly_chart(fig_bridge, use_container_width=True)
+            with bc2:
+                st.markdown("##### Composition of enterprise value")
+                st.dataframe(pd.DataFrame({
+                    "Component": ["PV — explicit period", "PV — terminal value", "Enterprise value"],
+                    "₹ Cr": [round(sum(res["pv_list"]),1), round(res["pv_terminal"],1), round(res["ev"],1)],
+                }), hide_index=True, use_container_width=True)
+            st.caption("Terminal value = FCF in final explicit year × (1 + terminal growth) / (WACC − terminal growth), then discounted back N years.")
+
+    # ── TAB 8 — Reverse DCF Calculator ───────────────────────────────────────
+    with calc8:
+        st.markdown("#### Reverse DCF — what growth is the market pricing in?")
+        st.caption("Holds price, WACC and terminal growth fixed, and solves for the explicit-period growth rate that justifies today's price.")
+
+        rc1, rc2, rc3 = st.columns(3)
+        rdcf_cmp    = rc1.number_input("Current market price (₹)", min_value=0.01, value=800.0, step=1.0, key="rdcf_cmp")
+        rdcf_shares = rc2.number_input("Shares outstanding (Cr)", min_value=0.01, value=50.0, step=1.0, key="rdcf_shares")
+        rdcf_debt   = rc3.number_input("Net debt (₹ Cr) — negative if net cash", value=200.0, step=10.0, key="rdcf_debt")
+
+        rc4, rc5, rc6, rc7 = st.columns(4)
+        rdcf_fcf  = rc4.number_input("Base FCF — last 12m (₹ Cr)", min_value=0.01, value=500.0, step=10.0, key="rdcf_fcf")
+        rdcf_n1   = rc5.number_input("Explicit period (years)", min_value=1, max_value=20, value=10, step=1, key="rdcf_n1")
+        rdcf_gt   = rc6.number_input("Terminal growth rate (%)", value=4.0, step=0.25, key="rdcf_gt")
+        rdcf_wacc = rc7.number_input("Discount rate / WACC (%)", min_value=0.1, value=11.0, step=0.25, key="rdcf_wacc")
+
+        if rdcf_wacc <= rdcf_gt:
+            st.error("Discount rate must be greater than the terminal growth rate — adjust the inputs above.")
+        else:
+            r_dec, gt_dec = rdcf_wacc/100, rdcf_gt/100
+            target = rdcf_cmp
+
+            def _ps(g1):
+                out = _dcf_core(rdcf_fcf, g1, rdcf_n1, gt_dec, r_dec, rdcf_debt, rdcf_shares)
+                return out["per_share"] if out else float("-inf")
+
+            lo, hi = -0.50, 3.00
+            if _ps(lo) > target:
+                st.warning("Even a −50% growth assumption exceeds today's price — the market may be pricing in a decline steeper than this model's range.")
+            elif _ps(hi) < target:
+                st.warning("Even 300% growth doesn't reach today's price with these WACC/terminal assumptions — try lowering WACC or raising terminal growth.")
+            else:
+                for _ in range(60):
+                    mid = (lo + hi) / 2
+                    if _ps(mid) < target:
+                        lo = mid
+                    else:
+                        hi = mid
+                implied_g = (lo + hi) / 2
+
+                m1, m2 = st.columns(2)
+                _metric(m1, f"{implied_g*100:,.2f}%", "Implied growth rate (explicit period)")
+                _metric(m2, f"₹{_ps(implied_g):,.2f}", "Model price at that growth")
+
+                g_range = [x/1000 for x in range(-500, 1010, 10)]
+                px_vals = [_ps(g) for g in g_range]
+                fig_rev = go.Figure()
+                fig_rev.add_trace(go.Scatter(x=[g*100 for g in g_range], y=px_vals, name="Intrinsic value", line=dict(color=ACCENT, width=3)))
+                fig_rev.add_hline(y=rdcf_cmp, line_dash="dot", line_color=DANGER,
+                                   annotation_text=f"CMP ₹{rdcf_cmp:,.0f}", annotation_position="top left")
+                fig_rev.add_vline(x=implied_g*100, line_dash="dot", line_color=INK_MUTED)
+                fig_rev.add_trace(go.Scatter(x=[implied_g*100], y=[rdcf_cmp], mode="markers",
+                                              marker=dict(color=DANGER, size=10), name="Implied growth"))
+                fig_rev.update_layout(xaxis_title="Assumed explicit-period growth rate (%)", yaxis_title="Intrinsic value / share (₹)")
+                st.plotly_chart(_plotly_defaults(fig_rev, height=360), use_container_width=True)
+                st.caption("Where the blue curve crosses the current market price is the growth rate the market is implicitly assuming.")
+
+    st.markdown("<div style='height:0.5rem'></div>", unsafe_allow_html=True)
+    st.caption("These calculators are for quick estimation only and are not tax, investment or financial advice .")
+
 
 elif page == "My Activity":
 
