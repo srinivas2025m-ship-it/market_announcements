@@ -40,6 +40,117 @@ from datetime import datetime
 
 from idea_rules import IDEA_TYPES, GROUPS, CATEGORY_BONUS_WEIGHT, MIN_SCORE_THRESHOLD
 
+# ─────────────────────────────────────────────────────────────────────────
+# SOURCE NORMALIZATION
+# ─────────────────────────────────────────────────────────────────────────
+# The four market_announcements.py databases (bse_equity.db / bse_sme.db /
+# nse_equity.db / nse_sme.db) each store `announcements` with a DIFFERENT
+# native schema:
+#
+#   BSE Equity : company_name, symbol, scrip_code, subject, input_timestamp,
+#                attachment_url/file_name, category_id/subcategory_id
+#                (exposed as a ready-made view `v_announcements`)
+#   BSE SME    : scrip_name, scrip_code, category, grp, purpose, announce_date,
+#                attachment_url   (no v_announcements view)
+#   NSE Eq/SME : symbol, company_name, subject, ann_date ("28-Jun-2026 23:26:37"),
+#                attachment_url   (no v_announcements view)
+#
+# Everything downstream (classify/export, and the Idea Board + Tracker in
+# market_suite.py) is written once against a single canonical shape. This
+# view maps whichever native schema is present onto that shape so the SAME
+# pipeline invocation (`--db <any of the 4 dbs> run`) works everywhere.
+SOURCE_VIEW = "v_idea_source"
+
+_NSE_DATE_TO_ISO = """
+    (CASE
+       WHEN length(ann_date) >= 11 THEN
+         substr(ann_date,8,4)||'-'||
+         CASE substr(ann_date,4,3)
+           WHEN 'Jan' THEN '01' WHEN 'Feb' THEN '02' WHEN 'Mar' THEN '03'
+           WHEN 'Apr' THEN '04' WHEN 'May' THEN '05' WHEN 'Jun' THEN '06'
+           WHEN 'Jul' THEN '07' WHEN 'Aug' THEN '08' WHEN 'Sep' THEN '09'
+           WHEN 'Oct' THEN '10' WHEN 'Nov' THEN '11' WHEN 'Dec' THEN '12'
+           ELSE '00' END||'-'||
+         substr(ann_date,1,2)||substr(ann_date,12)
+       ELSE ann_date
+     END)
+"""
+
+
+def _table_cols(conn, table):
+    try:
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    except sqlite3.OperationalError:
+        return set()
+
+
+def ensure_source_view(conn):
+    """(Re)creates SOURCE_VIEW so it always reflects the current underlying
+    schema, mapping it onto the canonical column set:
+        id, company_name, symbol, scrip_code, subject,
+        input_timestamp, attachment_url, category, subcategory
+    Safe to call repeatedly (e.g. once per command)."""
+    cur = conn.cursor()
+    ann_cols = _table_cols(conn, "announcements")
+    if not ann_cols:
+        raise sqlite3.OperationalError(
+            "no `announcements` table found in this database — run market_announcements.py first"
+        )
+    view_cols = _table_cols(conn, "v_announcements")
+    id_col = "id" if "id" in ann_cols else "rowid"
+
+    if view_cols and {"company_name", "symbol", "subject", "input_timestamp"}.issubset(view_cols):
+        # BSE Equity-style: a ready-made view already exposes the canonical shape.
+        has_cat = {"category", "subcategory"}.issubset(view_cols)
+        select_sql = f"""
+            SELECT id AS id, company_name, symbol, scrip_code, subject,
+                   input_timestamp, attachment_url,
+                   {"category" if has_cat else "NULL"} AS category,
+                   {"subcategory" if has_cat else "NULL"} AS subcategory
+            FROM v_announcements
+        """
+    elif {"scrip_name", "purpose", "announce_date"}.issubset(ann_cols):
+        # BSE SME-style
+        select_sql = f"""
+            SELECT {id_col} AS id, scrip_name AS company_name, scrip_code AS symbol,
+                   scrip_code AS scrip_code, purpose AS subject,
+                   announce_date AS input_timestamp,
+                   {"attachment_url" if "attachment_url" in ann_cols else "NULL"} AS attachment_url,
+                   {"category" if "category" in ann_cols else "NULL"} AS category,
+                   {"grp" if "grp" in ann_cols else "NULL"} AS subcategory
+            FROM announcements
+        """
+    elif {"symbol", "company_name", "subject", "ann_date"}.issubset(ann_cols):
+        # NSE Equity / NSE SME-style (same schema for both)
+        select_sql = f"""
+            SELECT {id_col} AS id, company_name, symbol, NULL AS scrip_code, subject,
+                   {_NSE_DATE_TO_ISO} AS input_timestamp,
+                   {"attachment_url" if "attachment_url" in ann_cols else "NULL"} AS attachment_url,
+                   NULL AS category, NULL AS subcategory
+            FROM announcements
+        """
+    elif {"company_name", "symbol", "subject", "input_timestamp"}.issubset(ann_cols):
+        # Canonical shape already present directly on the table.
+        select_sql = f"""
+            SELECT {id_col} AS id, company_name, symbol,
+                   {"scrip_code" if "scrip_code" in ann_cols else "NULL"} AS scrip_code,
+                   subject, input_timestamp,
+                   {"attachment_url" if "attachment_url" in ann_cols else "NULL"} AS attachment_url,
+                   {"category" if "category" in ann_cols else "NULL"} AS category,
+                   {"subcategory" if "subcategory" in ann_cols else "NULL"} AS subcategory
+            FROM announcements
+        """
+    else:
+        raise sqlite3.OperationalError(
+            f"don't recognize this database's `announcements` schema (columns: {sorted(ann_cols)}); "
+            f"can't build {SOURCE_VIEW}"
+        )
+
+    cur.execute(f"DROP VIEW IF EXISTS {SOURCE_VIEW}")
+    cur.execute(f"CREATE VIEW {SOURCE_VIEW} AS {select_sql}")
+    conn.commit()
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS idea_groups (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -80,7 +191,14 @@ CREATE INDEX IF NOT EXISTS idx_idea_scores_score ON announcement_idea_scores(sco
 CREATE INDEX IF NOT EXISTS idx_idea_scores_type_score ON announcement_idea_scores(idea_type_id, score DESC);
 CREATE INDEX IF NOT EXISTS idx_idea_scores_ann   ON announcement_idea_scores(announcement_id);
 
-CREATE VIEW IF NOT EXISTS v_announcement_ideas AS
+"""
+
+# v_announcement_ideas joins against SOURCE_VIEW (not the raw `announcements`
+# table) so it works regardless of which of the 4 DBs this is run against —
+# built separately from SCHEMA_SQL because it depends on ensure_source_view()
+# having run first.
+V_ANNOUNCEMENT_IDEAS_SQL = f"""
+CREATE VIEW v_announcement_ideas AS
 SELECT
     s.id AS score_id,
     a.id AS announcement_id,
@@ -90,16 +208,19 @@ SELECT
     it.name AS idea_type,
     s.score, s.matched_keywords
 FROM announcement_idea_scores s
-JOIN announcements a ON a.id = s.announcement_id
+JOIN {SOURCE_VIEW} a ON a.id = s.announcement_id
 JOIN idea_types    it ON it.id = s.idea_type_id
 JOIN idea_groups    g ON g.id = it.group_id;
 """
 
 
 def migrate(conn):
+    ensure_source_view(conn)
     conn.executescript(SCHEMA_SQL)
+    conn.execute("DROP VIEW IF EXISTS v_announcement_ideas")
+    conn.execute(V_ANNOUNCEMENT_IDEAS_SQL)
     conn.commit()
-    print("[migrate] schema ready.")
+    print(f"[migrate] schema ready ({SOURCE_VIEW} + idea tables).")
 
 
 def seed(conn):
@@ -183,12 +304,8 @@ def _cap_for(cfg):
 
 def classify(conn, recompute=False, date_from=None, date_to=None):
     cur = conn.cursor()
-    # make sure v_announcements (category/subcategory join view) exists; fall back to raw table
-    try:
-        cur.execute("SELECT 1 FROM v_announcements LIMIT 1")
-        source = "v_announcements"
-    except sqlite3.OperationalError:
-        source = "announcements"
+    ensure_source_view(conn)
+    source = SOURCE_VIEW
 
     type_id = {r[0]: r[1] for r in cur.execute("SELECT name, id FROM idea_types")}
     caps = {name: _cap_for(cfg) for name, cfg in IDEA_TYPES.items()}
@@ -201,11 +318,7 @@ def classify(conn, recompute=False, date_from=None, date_to=None):
         else:
             cur.execute("DELETE FROM announcement_idea_scores")
 
-    base_sql = (
-        f"SELECT id, subject, category, subcategory FROM {source}"
-        if source == "v_announcements" else
-        f"SELECT id, subject, NULL, NULL FROM {source}"
-    )
+    base_sql = f"SELECT id, subject, category, subcategory FROM {source}"
     sql, params = _apply_date_filter(base_sql, [], date_from, date_to)
     rows = cur.execute(sql, params).fetchall()
 
@@ -264,6 +377,7 @@ def classify(conn, recompute=False, date_from=None, date_to=None):
 
 def export(conn, out_path, date_from=None, date_to=None):
     cur = conn.cursor()
+    ensure_source_view(conn)
     groups = cur.execute("SELECT id, name FROM idea_groups ORDER BY sort_order").fetchall()
     result = {"generated_at": datetime.now().isoformat(timespec="seconds"), "groups": []}
 
@@ -274,10 +388,10 @@ def export(conn, out_path, date_from=None, date_to=None):
         group_entry = {"name": gname, "types": []}
         for tid, tname, tdesc in types:
             items_sql = (
-                """SELECT a.id, a.company_name, a.symbol, a.scrip_code, a.subject,
+                f"""SELECT a.id, a.company_name, a.symbol, a.scrip_code, a.subject,
                           a.input_timestamp, a.attachment_url, s.score, s.matched_keywords
                    FROM announcement_idea_scores s
-                   JOIN announcements a ON a.id = s.announcement_id
+                   JOIN {SOURCE_VIEW} a ON a.id = s.announcement_id
                    WHERE s.idea_type_id = ?"""
             )
             items_params = [tid]

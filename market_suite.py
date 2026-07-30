@@ -86,6 +86,19 @@ try:
 except Exception as e:
     _IDEA_RULES_OK, _IDEA_RULES_ERR = False, str(e)
 
+# announcement_ideas_pipeline.py → same taxonomy engine, but also owns
+# ensure_source_view(), which normalizes each source DB's native schema
+# (BSE Equity / BSE SME / NSE Equity / NSE SME all differ) onto one common
+# shape so the Idea Board + Tracker below can be a single set of functions
+# reused across all four sources.
+try:
+    import announcement_ideas_pipeline as idea_pipeline
+    _IDEA_PIPELINE_OK, _IDEA_PIPELINE_ERR = True, ""
+except Exception as e:
+    _IDEA_PIPELINE_OK, _IDEA_PIPELINE_ERR = False, str(e)
+
+IDEA_SOURCE_VIEW = "v_idea_source"  # matches announcement_ideas_pipeline.SOURCE_VIEW
+
 # ─── DB PATHS  (edit if your files live elsewhere) ───────────────────────────
 
 DB_PATHS = {
@@ -808,12 +821,21 @@ def _apply_report_settings(disp_df: pd.DataFrame, settings: tuple) -> pd.DataFra
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  IDEA BOARD  (embedded from idea_board_streamlit_02.py, scoped to BSE Equity)
+#  IDEA BOARD  (embedded from idea_board_streamlit_02.py — generalized to
+#  ALL FOUR sources, not just BSE Equity)
 #
-#  Reads the idea_groups / idea_types / announcement_idea_scores / announcements
-#  tables that announcement_ideas_pipeline.py writes into the SAME bse_equity.db
-#  used elsewhere in this app (DB_PATHS["BSE Equity"]). All keys/functions are
-#  prefixed idb_ / _idb_ to avoid clashing with the rest of the dashboard.
+#  Reads the idea_groups / idea_types / announcement_idea_scores tables that
+#  announcement_ideas_pipeline.py writes into whichever DB it's pointed at
+#  (bse_equity.db / bse_sme.db / nse_equity.db / nse_sme.db), joined against
+#  that DB's normalized `v_idea_source` view (see announcement_ideas_pipeline.
+#  ensure_source_view — it maps each source's native schema onto one common
+#  shape: id, company_name, symbol, scrip_code, subject, input_timestamp,
+#  attachment_url, category, subcategory).
+#
+#  Every function takes a `kp` (key_prefix) argument — a short per-source tag
+#  ("be"/"bs"/"ne"/"ns") — prepended to every widget key and session_state
+#  key, so the same functions can be rendered once per source tab in the
+#  same Streamlit run without clashing.
 # ═════════════════════════════════════════════════════════════════════════════
 
 IDB_PAGE_SIZE = 15
@@ -824,6 +846,18 @@ def _idb_connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.execute("PRAGMA query_only = ON")
     return conn
+
+
+def _idb_ensure_source_view(db_path: str):
+    """Creates/refreshes v_idea_source in db_path (needs a writable
+    connection, unlike the rest of the idb_ helpers)."""
+    if not _IDEA_PIPELINE_OK:
+        return
+    conn = sqlite3.connect(db_path)
+    try:
+        idea_pipeline.ensure_source_view(conn)
+    finally:
+        conn.close()
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -847,7 +881,7 @@ def idb_get_meta(db_path: str, mtime: float):
 def idb_get_date_bounds(db_path: str, mtime: float):
     conn = _idb_connect(db_path)
     try:
-        row = conn.execute("SELECT MIN(input_timestamp), MAX(input_timestamp) FROM announcements").fetchone()
+        row = conn.execute(f"SELECT MIN(input_timestamp), MAX(input_timestamp) FROM {IDEA_SOURCE_VIEW}").fetchone()
     finally:
         conn.close()
     if not row or not row[0] or not row[1]:
@@ -863,10 +897,10 @@ def idb_get_type_counts(db_path: str, mtime: float, date_start, date_end):
     conn = _idb_connect(db_path)
     try:
         if date_start and date_end:
-            q = """
+            q = f"""
                 SELECT s.idea_type_id AS id, COUNT(*) AS count, AVG(s.score) AS avg_score
                 FROM announcement_idea_scores s
-                JOIN announcements a ON a.id = s.announcement_id
+                JOIN {IDEA_SOURCE_VIEW} a ON a.id = s.announcement_id
                 WHERE a.input_timestamp >= ? AND a.input_timestamp <= ?
                 GROUP BY s.idea_type_id
             """
@@ -885,8 +919,8 @@ def idb_get_summary_metrics(db_path: str, mtime: float, date_start, date_end):
     try:
         if date_start and date_end:
             row = conn.execute(
-                """SELECT COUNT(DISTINCT s.announcement_id), COUNT(*)
-                   FROM announcement_idea_scores s JOIN announcements a ON a.id = s.announcement_id
+                f"""SELECT COUNT(DISTINCT s.announcement_id), COUNT(*)
+                   FROM announcement_idea_scores s JOIN {IDEA_SOURCE_VIEW} a ON a.id = s.announcement_id
                    WHERE a.input_timestamp >= ? AND a.input_timestamp <= ?""",
                 [f"{date_start} 00:00:00", f"{date_end} 23:59:59"],
             ).fetchone()
@@ -922,7 +956,7 @@ def idb_count_filtered(db_path, mtime, date_start, date_end, min_score, search, 
     conn = _idb_connect(db_path)
     try:
         n = conn.execute(
-            f"SELECT COUNT(*) FROM announcement_idea_scores s JOIN announcements a ON a.id = s.announcement_id WHERE {where_sql}",
+            f"SELECT COUNT(*) FROM announcement_idea_scores s JOIN {IDEA_SOURCE_VIEW} a ON a.id = s.announcement_id WHERE {where_sql}",
             params,
         ).fetchone()[0]
     finally:
@@ -939,7 +973,7 @@ def idb_fetch_page(db_path, mtime, date_start, date_end, min_score, search, idea
         SELECT s.id AS score_id, s.announcement_id, s.idea_type_id, s.score, s.matched_keywords,
                a.company_name, a.symbol, a.scrip_code, a.subject, a.input_timestamp, a.attachment_url
         FROM announcement_idea_scores s
-        JOIN announcements a ON a.id = s.announcement_id
+        JOIN {IDEA_SOURCE_VIEW} a ON a.id = s.announcement_id
         WHERE {where_sql}
         ORDER BY {order_expr} {order_dir}
         LIMIT ? OFFSET ?
@@ -984,20 +1018,23 @@ def idb_render_card(row) -> str:
     """
 
 
-def render_idea_board(db_path: str):
-    """Idea board scoped to BSE Equity — reads idea_groups / idea_types /
-    announcement_idea_scores from the same bse_equity.db used elsewhere in
-    this app. Run announcement_ideas_pipeline.py separately to populate the
-    idea tables (this view is read-only)."""
+def render_idea_board(db_path: str, kp: str, source_label: str = ""):
+    """Idea board for one source — reads idea_groups / idea_types /
+    announcement_idea_scores (joined via v_idea_source) from db_path. Run
+    announcement_ideas_pipeline.py --db <db_path> run (or the in-app
+    Guided Activity → ③ Score ideas step) to populate it; this view is
+    read-only. `kp` is a short per-source key prefix (e.g. "be"/"bs"/"ne"/"ns")
+    so widget/session keys don't collide when several sources' Idea Boards
+    exist in the same Streamlit run."""
 
-    st.caption("Corporate announcements categorized by key business events and developments · scored from `announcement_ideas_pipeline.py`")
+    st.caption(f"Corporate announcements categorized by key business events and developments · scored from `announcement_ideas_pipeline.py`{(' · ' + source_label) if source_label else ''}")
 
     with st.expander("⚙️ Data source", expanded=False):
         dcol1, dcol2 = st.columns([5, 1])
         with dcol1:
-            idb_db_path = st.text_input("SQLite database path", value=db_path, key="idb_db_path", label_visibility="collapsed")
+            idb_db_path = st.text_input("SQLite database path", value=db_path, key=f"{kp}_idb_db_path", label_visibility="collapsed")
         with dcol2:
-            idb_refresh = st.button("Refresh data", use_container_width=True, key="idb_refresh")
+            idb_refresh = st.button("Refresh data", use_container_width=True, key=f"{kp}_idb_refresh")
 
     idb_db_file = Path(idb_db_path)
     if not idb_db_file.exists():
@@ -1005,6 +1042,15 @@ def render_idea_board(db_path: str):
             f"Can't find `{idb_db_path}`. Run the pipeline first, e.g.\n\n"
             f"`python3 announcement_ideas_pipeline.py --db {idb_db_path} run`"
         )
+        return
+
+    if idb_refresh:
+        st.cache_data.clear()
+
+    try:
+        _idb_ensure_source_view(str(idb_db_file))
+    except Exception as e:
+        st.error(f"Couldn't read `{idb_db_path}`'s announcements schema: {e}")
         return
 
     idb_mtime = idb_db_file.stat().st_mtime
@@ -1020,7 +1066,6 @@ def render_idea_board(db_path: str):
         return
 
     if idb_refresh:
-        st.cache_data.clear()
         st.rerun()
 
     # ---------------- filters ----------------
@@ -1033,7 +1078,7 @@ def render_idea_board(db_path: str):
             default_start = max(bounds_min, bounds_max - pd.Timedelta(days=6))
             date_range = st.date_input(
                 "Date range", value=(default_start, bounds_max), min_value=bounds_min, max_value=bounds_max,
-                key="idb_date_range",
+                key=f"{kp}_idb_date_range",
             )
             if isinstance(date_range, tuple) and len(date_range) == 2:
                 date_start, date_end = date_range
@@ -1051,16 +1096,18 @@ def render_idea_board(db_path: str):
     types["avg_score"] = types["avg_score"].fillna(0).round(1)
 
     with fcol2:
-        search = st.text_input("Search company or subject", "", key="idb_search")
+        search = st.text_input("Search company or subject", "", key=f"{kp}_idb_search")
     with fcol3:
-        min_score = st.slider("Minimum score", 0, 100, 0, step=5, key="idb_min_score")
+        min_score = st.slider("Minimum score", 0, 100, 0, step=5, key=f"{kp}_idb_min_score")
     with fcol4:
-        sort_by = st.selectbox("Sort by", ["Score (high to low)", "Date (newest first)"], key="idb_sort_by")
+        sort_by = st.selectbox("Sort by", ["Score (high to low)", "Date (newest first)"], key=f"{kp}_idb_sort_by")
 
-    if "idb_nav_group" not in st.session_state:
-        st.session_state.idb_nav_group = None  # None = top level (all groups)
-    if "idb_nav_type" not in st.session_state:
-        st.session_state.idb_nav_type = None   # None = showing the group itself, not one sub-category
+    nav_group_key = f"{kp}_idb_nav_group"
+    nav_type_key = f"{kp}_idb_nav_type"
+    if nav_group_key not in st.session_state:
+        st.session_state[nav_group_key] = None  # None = top level (all groups)
+    if nav_type_key not in st.session_state:
+        st.session_state[nav_type_key] = None   # None = showing the group itself, not one sub-category
 
     group_counts = types.groupby("group_name")["count"].sum().to_dict()
     groups_sorted = groups.sort_values("sort_order")
@@ -1083,7 +1130,7 @@ def render_idea_board(db_path: str):
     # ---------------- category navigation ----------------
     st.markdown("#### Browse by category")
 
-    if st.session_state.idb_nav_group is None:
+    if st.session_state[nav_group_key] is None:
         total_all = int(types["count"].sum())
         st.markdown(f"**● All groups**  ({total_all})")
         items = []
@@ -1092,52 +1139,52 @@ def render_idea_board(db_path: str):
             cnt = int(group_counts.get(gname, 0))
 
             def _idb_select_group(gname=gname):
-                st.session_state.idb_nav_group = gname
-                st.session_state.idb_nav_type = None
+                st.session_state[nav_group_key] = gname
+                st.session_state[nav_type_key] = None
 
-            items.append((f"{gname}  ({cnt})", f"idb_grp_{g['id']}", _idb_select_group))
+            items.append((f"{gname}  ({cnt})", f"{kp}_idb_grp_{g['id']}", _idb_select_group))
         _idb_nav_row(items)
         selected_group, selected_type = None, None
 
     else:
-        sub_types = types[types["group_name"] == st.session_state.idb_nav_group].sort_values("sort_order")
+        sub_types = types[types["group_name"] == st.session_state[nav_group_key]].sort_values("sort_order")
         group_total = int(sub_types["count"].sum())
 
         bcol1, bcol2 = st.columns([1, 5])
         with bcol1:
-            if st.button("← All groups", use_container_width=True, key="idb_back_to_groups"):
-                st.session_state.idb_nav_group = None
-                st.session_state.idb_nav_type = None
+            if st.button("← All groups", use_container_width=True, key=f"{kp}_idb_back_to_groups"):
+                st.session_state[nav_group_key] = None
+                st.session_state[nav_type_key] = None
                 st.rerun()
         with bcol2:
-            crumb = f"**{st.session_state.idb_nav_group}**"
-            if st.session_state.idb_nav_type:
-                crumb += f"  →  **{st.session_state.idb_nav_type}**"
+            crumb = f"**{st.session_state[nav_group_key]}**"
+            if st.session_state[nav_type_key]:
+                crumb += f"  →  **{st.session_state[nav_type_key]}**"
             st.markdown(crumb)
 
         items = []
-        all_marker = "●" if st.session_state.idb_nav_type is None else "○"
-        if st.session_state.idb_nav_type is not None:
+        all_marker = "●" if st.session_state[nav_type_key] is None else "○"
+        if st.session_state[nav_type_key] is not None:
             def _idb_select_all():
-                st.session_state.idb_nav_type = None
-            items.append((f"{all_marker} All in {st.session_state.idb_nav_group}  ({group_total})", "idb_type_all", _idb_select_all))
+                st.session_state[nav_type_key] = None
+            items.append((f"{all_marker} All in {st.session_state[nav_group_key]}  ({group_total})", f"{kp}_idb_type_all", _idb_select_all))
         else:
-            st.markdown(f"{all_marker} **All in {st.session_state.idb_nav_group}**  ({group_total}) — showing below")
+            st.markdown(f"{all_marker} **All in {st.session_state[nav_group_key]}**  ({group_total}) — showing below")
 
         for _, t in sub_types.iterrows():
-            selected = st.session_state.idb_nav_type == t["name"]
+            selected = st.session_state[nav_type_key] == t["name"]
             marker = "●" if selected else "○"
             tname = t["name"]
 
             def _idb_select_type(tname=tname):
-                st.session_state.idb_nav_type = tname
+                st.session_state[nav_type_key] = tname
 
-            items.append((f"{marker} {tname}  ({int(t['count'])})", f"idb_type_{t['id']}", _idb_select_type))
+            items.append((f"{marker} {tname}  ({int(t['count'])})", f"{kp}_idb_type_{t['id']}", _idb_select_type))
 
         _idb_nav_row(items)
 
-        selected_group = st.session_state.idb_nav_group
-        selected_type = st.session_state.idb_nav_type
+        selected_group = st.session_state[nav_group_key]
+        selected_type = st.session_state[nav_type_key]
 
     if selected_type:
         idea_type_ids = tuple(types.loc[types["name"] == selected_type, "id"].tolist())
@@ -1158,17 +1205,19 @@ def render_idea_board(db_path: str):
     st.divider()
 
     # ---------------- pagination state ----------------
+    page_key = f"{kp}_idb_page"
+    filters_key_key = f"{kp}_idb_filters_key"
     filters_key = f"{search}|{min_score}|{sort_by}|{idea_type_ids}|{date_start}|{date_end}"
-    if st.session_state.get("idb_filters_key") != filters_key:
-        st.session_state.idb_filters_key = filters_key
-        st.session_state.idb_page = 1
+    if st.session_state.get(filters_key_key) != filters_key:
+        st.session_state[filters_key_key] = filters_key
+        st.session_state[page_key] = 1
 
     sort_col, sort_asc = ("score", False) if sort_by.startswith("Score") else ("input_timestamp", False)
 
     total_items = idb_count_filtered(str(idb_db_file), idb_mtime, date_start, date_end, min_score, search, idea_type_ids)
     total_pages = max(1, -(-total_items // IDB_PAGE_SIZE))
-    idb_page = min(max(st.session_state.get("idb_page", 1), 1), total_pages)
-    st.session_state.idb_page = idb_page
+    idb_page = min(max(st.session_state.get(page_key, 1), 1), total_pages)
+    st.session_state[page_key] = idb_page
     offset = (idb_page - 1) * IDB_PAGE_SIZE
 
     page_df = idb_fetch_page(
@@ -1197,8 +1246,8 @@ def render_idea_board(db_path: str):
         st.divider()
         pcol1, pcol2, pcol3 = st.columns([1, 2, 1])
         with pcol1:
-            if st.button("← Previous", disabled=idb_page <= 1, use_container_width=True, key="idb_prev"):
-                st.session_state.idb_page = idb_page - 1
+            if st.button("← Previous", disabled=idb_page <= 1, use_container_width=True, key=f"{kp}_idb_prev"):
+                st.session_state[page_key] = idb_page - 1
                 st.rerun()
         with pcol2:
             start_n = offset + 1
@@ -1209,22 +1258,23 @@ def render_idea_board(db_path: str):
                 unsafe_allow_html=True,
             )
         with pcol3:
-            if st.button("Next →", disabled=idb_page >= total_pages, use_container_width=True, key="idb_next"):
-                st.session_state.idb_page = idb_page + 1
+            if st.button("Next →", disabled=idb_page >= total_pages, use_container_width=True, key=f"{kp}_idb_next"):
+                st.session_state[page_key] = idb_page + 1
                 st.rerun()
 
-    _log_search("BSE Equity — Idea Board", {"search": search, "min_score": min_score, "group": selected_group, "type": selected_type}, total_items)
+    _log_search(f"{source_label} — Idea Board" if source_label else "Idea Board", {"search": search, "min_score": min_score, "group": selected_group, "type": selected_type}, total_items)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-#  TRACKER  (embedded from app.py, scoped to BSE Equity)
+#  TRACKER  (embedded from app.py — generalized to ALL FOUR sources)
 #
 #  Search + one-click Overview + a status/notes tracker + a starred Watchlist
-#  on top of the SAME bse_equity.db used elsewhere in this app
-#  (DB_PATHS["BSE Equity"]). Adds three of its own tables (announcement_notes /
+#  on top of whichever DB db_path points at, read via that DB's normalized
+#  `v_idea_source` view. Adds three of its own tables (announcement_notes /
 #  announcement_status / watchlist) the first time it runs, IF NOT EXISTS.
 #  All keys/functions are prefixed trk_ / _trk_ to avoid clashing with the
-#  rest of the dashboard.
+#  rest of the dashboard; every widget/session key additionally takes a `kp`
+#  (key_prefix) so multiple sources' Trackers can coexist in one run.
 # ═════════════════════════════════════════════════════════════════════════════
 
 TRK_STATUS_OPTIONS = ["New", "Watching", "Important", "Actioned", "Ignored"]
@@ -1238,8 +1288,14 @@ def _trk_conn(db_path: str) -> sqlite3.Connection:
 
 def _trk_init_db(db_path: str):
     """Creates the tracker's own tables (notes / status / watchlist) if they
-    don't exist yet. Doesn't touch announcements / idea tables — those are
-    owned by market_announcements.py and announcement_ideas_pipeline.py."""
+    don't exist yet, and (re)builds v_idea_source. Doesn't touch the raw
+    announcements table — that's owned by market_announcements.py."""
+    if _IDEA_PIPELINE_OK:
+        conn = sqlite3.connect(db_path)
+        try:
+            idea_pipeline.ensure_source_view(conn)
+        finally:
+            conn.close()
     conn = _trk_conn(db_path)
     try:
         conn.executescript(
@@ -1334,9 +1390,10 @@ def _trk_get_watchlist_ids(db_path) -> set:
 
 def _trk_get_categories(db_path):
     try:
-        return _trk_run_query(db_path, "SELECT id, name FROM categories ORDER BY name")
+        df = _trk_run_query(db_path, f"SELECT DISTINCT category AS name FROM {IDEA_SOURCE_VIEW} WHERE category IS NOT NULL AND category != '' ORDER BY category")
+        return df
     except Exception:
-        return pd.DataFrame(columns=["id", "name"])
+        return pd.DataFrame(columns=["name"])
 
 
 def _trk_get_idea_types(db_path):
@@ -1370,34 +1427,34 @@ def _trk_get_note_counts(db_path):
         return {}
 
 
-def _trk_go_to_overview(ann_id: int):
-    st.session_state.trk_selected_id = ann_id
-    st.session_state.trk_view = "overview"
+def _trk_go_to_overview(kp, ann_id: int):
+    st.session_state[f"{kp}_trk_selected_id"] = ann_id
+    st.session_state[f"{kp}_trk_view"] = "overview"
 
 
-def _trk_go_to_search():
-    st.session_state.trk_view = "search"
-    st.session_state.trk_confirm_delete_id = None
+def _trk_go_to_search(kp):
+    st.session_state[f"{kp}_trk_view"] = "search"
+    st.session_state[f"{kp}_trk_confirm_delete_id"] = None
 
 
-def _trk_go_to_watchlist():
-    st.session_state.trk_view = "watchlist"
+def _trk_go_to_watchlist(kp):
+    st.session_state[f"{kp}_trk_view"] = "watchlist"
 
 
-def _trk_ask_confirm_delete(ann_id: int):
-    st.session_state.trk_confirm_delete_id = ann_id
+def _trk_ask_confirm_delete(kp, ann_id: int):
+    st.session_state[f"{kp}_trk_confirm_delete_id"] = ann_id
 
 
-def _trk_cancel_delete():
-    st.session_state.trk_confirm_delete_id = None
+def _trk_cancel_delete(kp):
+    st.session_state[f"{kp}_trk_confirm_delete_id"] = None
 
 
-def _trk_do_delete(db_path, ann_id: int):
+def _trk_do_delete(kp, db_path, ann_id: int):
     _trk_delete_announcement(db_path, ann_id)
-    st.session_state.trk_confirm_delete_id = None
-    if st.session_state.trk_selected_id == ann_id:
-        st.session_state.trk_selected_id = None
-        st.session_state.trk_view = "search"
+    st.session_state[f"{kp}_trk_confirm_delete_id"] = None
+    if st.session_state[f"{kp}_trk_selected_id"] == ann_id:
+        st.session_state[f"{kp}_trk_selected_id"] = None
+        st.session_state[f"{kp}_trk_view"] = "search"
 
 
 def _trk_do_toggle_watchlist(db_path, ann_id, in_wl, company_name, symbol, scrip_code, subject):
@@ -1407,40 +1464,40 @@ def _trk_do_toggle_watchlist(db_path, ann_id, in_wl, company_name, symbol, scrip
         _trk_add_to_watchlist(db_path, ann_id, company_name, symbol, scrip_code, subject)
 
 
-def trk_render_search_page(db_path: str):
+def trk_render_search_page(db_path: str, kp: str):
     categories_df = _trk_get_categories(db_path)
     idea_types_df = _trk_get_idea_types(db_path)
 
-    with st.form("trk_search_form"):
+    with st.form(f"{kp}_trk_search_form"):
         c1, c2, c3 = st.columns([2, 1, 1])
         with c1:
             keyword = st.text_input(
                 "Search (company, symbol, scrip code, or subject)",
                 placeholder="e.g. Reliance, RELIANCE, 500325, buyback...",
-                key="trk_kw",
+                key=f"{kp}_trk_kw",
             )
         with c2:
             category_name = st.selectbox(
-                "Category", options=["Any"] + categories_df["name"].tolist(), key="trk_cat",
+                "Category", options=["Any"] + categories_df["name"].tolist(), key=f"{kp}_trk_cat",
             )
         with c3:
-            status_filter = st.selectbox("Status", options=["Any"] + TRK_STATUS_OPTIONS, key="trk_status_f")
+            status_filter = st.selectbox("Status", options=["Any"] + TRK_STATUS_OPTIONS, key=f"{kp}_trk_status_f")
 
         c4, c5, c6 = st.columns([1, 1, 1])
         with c4:
-            date_from = st.date_input("From date", value=None, format="YYYY-MM-DD", key="trk_from")
+            date_from = st.date_input("From date", value=None, format="YYYY-MM-DD", key=f"{kp}_trk_from")
         with c5:
-            date_to = st.date_input("To date", value=None, format="YYYY-MM-DD", key="trk_to")
+            date_to = st.date_input("To date", value=None, format="YYYY-MM-DD", key=f"{kp}_trk_to")
         with c6:
-            limit = st.number_input("Max results", min_value=10, max_value=5000, value=200, step=10, key="trk_limit")
+            limit = st.number_input("Max results", min_value=10, max_value=5000, value=200, step=10, key=f"{kp}_trk_limit")
 
         with st.expander("Idea / signal filters (optional)"):
             ic1, ic2 = st.columns([2, 1])
             with ic1:
                 idea_labels = (idea_types_df["group_name"] + " → " + idea_types_df["name"]).tolist()
-                idea_selection = st.multiselect("Idea types", options=idea_labels, key="trk_idea_sel")
+                idea_selection = st.multiselect("Idea types", options=idea_labels, key=f"{kp}_trk_idea_sel")
             with ic2:
-                min_score = st.number_input("Min score", value=0.0, step=0.5, key="trk_min_score")
+                min_score = st.number_input("Min score", value=0.0, step=0.5, key=f"{kp}_trk_min_score")
 
         st.form_submit_button("Search", type="primary", use_container_width=True)
 
@@ -1480,8 +1537,8 @@ def trk_render_search_page(db_path: str):
     where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
     sql = f"""
         SELECT DISTINCT a.id, a.company_name, a.symbol, a.scrip_code, a.category,
-               a.subcategory, a.subject, a.input_timestamp, a.file_name
-        FROM v_announcements a {joins}
+               a.subcategory, a.subject, a.input_timestamp, a.attachment_url
+        FROM {IDEA_SOURCE_VIEW} a {joins}
         {where_sql}
         ORDER BY a.input_timestamp DESC
         LIMIT ?
@@ -1515,6 +1572,7 @@ def trk_render_search_page(db_path: str):
         col.markdown(f"**{label}**")
     st.divider()
 
+    confirm_key = f"{kp}_trk_confirm_delete_id"
     for _, row in results.iterrows():
         ann_id = int(row["id"])
         cols = st.columns([2.1, 1.0, 1.3, 3.1, 1.2, 0.9, 1.7])
@@ -1537,32 +1595,32 @@ def trk_render_search_page(db_path: str):
         note_suffix = f" 📝{note_n}" if note_n else ""
         cols[5].markdown(f"{badge}{note_suffix}")
 
-        if st.session_state.trk_confirm_delete_id == ann_id:
+        if st.session_state.get(confirm_key) == ann_id:
             with cols[6]:
                 wc1, wc2 = st.columns(2)
                 wc1.button(
-                    "✅ Confirm", key=f"trk_confirm_del_{ann_id}",
-                    on_click=_trk_do_delete, args=(db_path, ann_id), use_container_width=True,
+                    "✅ Confirm", key=f"{kp}_trk_confirm_del_{ann_id}",
+                    on_click=_trk_do_delete, args=(kp, db_path, ann_id), use_container_width=True,
                 )
                 wc2.button(
-                    "✖ Cancel", key=f"trk_cancel_del_{ann_id}",
-                    on_click=_trk_cancel_delete, use_container_width=True,
+                    "✖ Cancel", key=f"{kp}_trk_cancel_del_{ann_id}",
+                    on_click=_trk_cancel_delete, args=(kp,), use_container_width=True,
                 )
         else:
             in_wl = ann_id in watchlist_ids
             with cols[6]:
                 ac1, ac2, ac3 = st.columns(3)
                 ac1.button(
-                    "👁️", key=f"trk_view_{ann_id}", help="Overview",
-                    on_click=_trk_go_to_overview, args=(ann_id,), use_container_width=True,
+                    "👁️", key=f"{kp}_trk_view_{ann_id}", help="Overview",
+                    on_click=_trk_go_to_overview, args=(kp, ann_id), use_container_width=True,
                 )
                 ac2.button(
-                    "🗑️", key=f"trk_del_{ann_id}", help="Delete this announcement",
-                    on_click=_trk_ask_confirm_delete, args=(ann_id,), use_container_width=True,
+                    "🗑️", key=f"{kp}_trk_del_{ann_id}", help="Delete this announcement",
+                    on_click=_trk_ask_confirm_delete, args=(kp, ann_id), use_container_width=True,
                 )
                 ac3.button(
                     "⭐" if not in_wl else "★",
-                    key=f"trk_wl_{ann_id}",
+                    key=f"{kp}_trk_wl_{ann_id}",
                     help="Remove from Watchlist" if in_wl else "Add to Watchlist",
                     on_click=_trk_do_toggle_watchlist,
                     args=(db_path, ann_id, in_wl, row["company_name"], row["symbol"], row["scrip_code"], row["subject"]),
@@ -1571,11 +1629,11 @@ def trk_render_search_page(db_path: str):
         st.divider()
 
 
-def trk_render_overview_page(db_path: str):
-    ann_id = st.session_state.trk_selected_id
-    st.button("← Back to search", on_click=_trk_go_to_search, key="trk_back_btn")
+def trk_render_overview_page(db_path: str, kp: str):
+    ann_id = st.session_state[f"{kp}_trk_selected_id"]
+    st.button("← Back to search", on_click=_trk_go_to_search, args=(kp,), key=f"{kp}_trk_back_btn")
 
-    ann_df = _trk_run_query(db_path, "SELECT * FROM v_announcements WHERE id = ?", (ann_id,))
+    ann_df = _trk_run_query(db_path, f"SELECT * FROM {IDEA_SOURCE_VIEW} WHERE id = ?", (ann_id,))
     if ann_df.empty:
         st.error("Announcement not found.")
         return
@@ -1591,13 +1649,10 @@ def trk_render_overview_page(db_path: str):
     st.markdown("**Subject**")
     st.write(ann["subject"] or "—")
 
-    meta_cols = st.columns(2)
-    meta_cols[0].write(f"**Filed:** {ann['input_timestamp'] or '—'}")
-    meta_cols[1].write(f"**Fetched at:** {ann['fetched_at'] if 'fetched_at' in ann else '—'}")
+    st.write(f"**Filed:** {ann['input_timestamp'] or '—'}")
 
-    file_name = ann["file_name"] if "file_name" in ann else None
-    if file_name:
-        st.link_button("📎 Open attachment / PDF", f"{BSE_ATTACH_BASE}{file_name}")
+    if ann["attachment_url"]:
+        st.link_button("📎 Open attachment / PDF", ann["attachment_url"])
 
     idea_df = _trk_run_query(
         db_path,
@@ -1627,12 +1682,12 @@ def trk_render_overview_page(db_path: str):
             "Track this announcement as",
             TRK_STATUS_OPTIONS,
             index=TRK_STATUS_OPTIONS.index(cur_status) if cur_status in TRK_STATUS_OPTIONS else 0,
-            key=f"trk_status_sel_{ann_id}",
+            key=f"{kp}_trk_status_sel_{ann_id}",
         )
     with sc2:
         st.write("")
         st.write("")
-        if st.button("Save status", use_container_width=True, key=f"trk_save_status_{ann_id}"):
+        if st.button("Save status", use_container_width=True, key=f"{kp}_trk_save_status_{ann_id}"):
             _trk_execute(
                 db_path,
                 """INSERT INTO announcement_status (announcement_id, status, updated_at)
@@ -1647,7 +1702,7 @@ def trk_render_overview_page(db_path: str):
     st.divider()
 
     st.markdown("**📝 Notes**")
-    with st.form(f"trk_note_form_{ann_id}", clear_on_submit=True):
+    with st.form(f"{kp}_trk_note_form_{ann_id}", clear_on_submit=True):
         new_note = st.text_area("Add a note", placeholder="Type a quick note about this announcement...")
         add_clicked = st.form_submit_button("Add note", type="primary")
     if add_clicked and new_note.strip():
@@ -1671,12 +1726,12 @@ def trk_render_overview_page(db_path: str):
                 nc1, nc2 = st.columns([5, 1])
                 nc1.write(n["note"])
                 nc1.caption(n["created_at"])
-                if nc2.button("🗑️ Delete", key=f"trk_del_note_{n['id']}"):
+                if nc2.button("🗑️ Delete", key=f"{kp}_trk_del_note_{n['id']}"):
                     _trk_execute(db_path, "DELETE FROM announcement_notes WHERE id = ?", (int(n["id"]),))
                     st.rerun()
 
 
-def trk_render_watchlist_page(db_path: str):
+def trk_render_watchlist_page(db_path: str, kp: str):
     st.caption("Announcements you've flagged with the ⭐ icon, tracked separately from the raw feed.")
 
     wl_df = _trk_run_query(db_path, "SELECT * FROM watchlist ORDER BY added_at DESC")
@@ -1692,27 +1747,27 @@ def trk_render_watchlist_page(db_path: str):
             top = st.columns([3, 1, 1, 1])
             top[0].markdown(f"**{w['company_name'] or '—'}**  ({w['symbol'] or w['scrip_code'] or '—'})")
             top[1].caption(f"Added: {w['added_at']}")
-            if top[2].button("Overview →", key=f"trk_wl_open_{wl_id}"):
-                _trk_go_to_overview(ann_id)
+            if top[2].button("Overview →", key=f"{kp}_trk_wl_open_{wl_id}"):
+                _trk_go_to_overview(kp, ann_id)
                 st.rerun()
-            if top[3].button("🗑️ Remove", key=f"trk_wl_remove_{wl_id}"):
+            if top[3].button("🗑️ Remove", key=f"{kp}_trk_wl_remove_{wl_id}"):
                 _trk_remove_from_watchlist(db_path, ann_id)
                 st.rerun()
 
             st.write(w["subject"] or "—")
 
-            with st.form(f"trk_wl_edit_{wl_id}"):
+            with st.form(f"{kp}_trk_wl_edit_{wl_id}"):
                 ec1, ec2, ec3 = st.columns([1, 1, 2])
                 target_price = ec1.number_input(
                     "Target price", value=float(w["target_price"]) if w["target_price"] is not None else 0.0,
-                    step=0.5, key=f"trk_tp_{wl_id}",
+                    step=0.5, key=f"{kp}_trk_tp_{wl_id}",
                 )
                 wl_status = ec2.selectbox(
                     "Status", ["Active", "Hit Target", "Closed"],
                     index=["Active", "Hit Target", "Closed"].index(w["status"]) if w["status"] in ["Active", "Hit Target", "Closed"] else 0,
-                    key=f"trk_wst_{wl_id}",
+                    key=f"{kp}_trk_wst_{wl_id}",
                 )
-                remarks = ec3.text_input("Remarks", value=w["remarks"] or "", key=f"trk_rm_{wl_id}")
+                remarks = ec3.text_input("Remarks", value=w["remarks"] or "", key=f"{kp}_trk_rm_{wl_id}")
                 if st.form_submit_button("Save"):
                     _trk_execute(
                         db_path,
@@ -1722,13 +1777,16 @@ def trk_render_watchlist_page(db_path: str):
                     st.rerun()
 
 
-def render_tracker(db_path: str):
+def render_tracker(db_path: str, kp: str):
     """Entry point for the embedded Tracker sub-tab — search, one-click
-    overview with status/notes, and a starred watchlist, all scoped to the
-    same BSE Equity database used by the Announcements and Idea Board tabs."""
-    st.session_state.setdefault("trk_view", "search")
-    st.session_state.setdefault("trk_selected_id", None)
-    st.session_state.setdefault("trk_confirm_delete_id", None)
+    overview with status/notes, and a starred watchlist, scoped to db_path.
+    `kp` is a short per-source key prefix (e.g. "be"/"bs"/"ne"/"ns")."""
+    view_key = f"{kp}_trk_view"
+    sel_key = f"{kp}_trk_selected_id"
+    confirm_key = f"{kp}_trk_confirm_delete_id"
+    st.session_state.setdefault(view_key, "search")
+    st.session_state.setdefault(sel_key, None)
+    st.session_state.setdefault(confirm_key, None)
 
     try:
         _trk_init_db(db_path)
@@ -1736,26 +1794,26 @@ def render_tracker(db_path: str):
         st.error(f"Could not initialize tracker tables: {e}")
         return
 
-    if st.session_state.trk_view != "overview":
+    if st.session_state[view_key] != "overview":
         nav1, nav2, _ = st.columns([1, 1, 4])
         nav1.button(
-            "🔍 Search", use_container_width=True, key="trk_nav_search",
-            type="primary" if st.session_state.trk_view == "search" else "secondary",
-            on_click=_trk_go_to_search,
+            "🔍 Search", use_container_width=True, key=f"{kp}_trk_nav_search",
+            type="primary" if st.session_state[view_key] == "search" else "secondary",
+            on_click=_trk_go_to_search, args=(kp,),
         )
         nav2.button(
-            "⭐ Watchlist", use_container_width=True, key="trk_nav_watchlist",
-            type="primary" if st.session_state.trk_view == "watchlist" else "secondary",
-            on_click=_trk_go_to_watchlist,
+            "⭐ Watchlist", use_container_width=True, key=f"{kp}_trk_nav_watchlist",
+            type="primary" if st.session_state[view_key] == "watchlist" else "secondary",
+            on_click=_trk_go_to_watchlist, args=(kp,),
         )
         st.divider()
 
-    if st.session_state.trk_view == "overview" and st.session_state.trk_selected_id is not None:
-        trk_render_overview_page(db_path)
-    elif st.session_state.trk_view == "watchlist":
-        trk_render_watchlist_page(db_path)
+    if st.session_state[view_key] == "overview" and st.session_state[sel_key] is not None:
+        trk_render_overview_page(db_path, kp)
+    elif st.session_state[view_key] == "watchlist":
+        trk_render_watchlist_page(db_path, kp)
     else:
-        trk_render_search_page(db_path)
+        trk_render_search_page(db_path, kp)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1898,8 +1956,9 @@ def ga_ensure_idea_tables(db_path: str):
 
 def ga_score_announcements(db_path: str, date_start, date_end, idea_type_names=None,
                             min_score=None, category_bonus=None, force_rescore=False) -> dict:
-    """Score BSE Equity `announcements` rows (via v_announcements) against the
-    idea_rules.py taxonomy and upsert into announcement_idea_scores.
+    """Score a source DB's `announcements` rows (via the normalized
+    v_idea_source view — works for BSE Equity, BSE SME, NSE Equity or NSE SME)
+    against the idea_rules.py taxonomy and upsert into announcement_idea_scores.
 
     Rule (matches idea_rules.py's documented scoring exactly):
       raw score = sum(weight) of every keyword phrase found in the subject
@@ -1912,12 +1971,19 @@ def ga_score_announcements(db_path: str, date_start, date_end, idea_type_names=N
     category_bonus = idea_rules.CATEGORY_BONUS_WEIGHT if category_bonus is None else category_bonus
     idea_names = idea_type_names or list(idea_rules.IDEA_TYPES.keys())
 
+    if _IDEA_PIPELINE_OK:
+        _view_conn = sqlite3.connect(db_path)
+        try:
+            idea_pipeline.ensure_source_view(_view_conn)
+        finally:
+            _view_conn.close()
+
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     try:
         type_ids = {r["name"]: r["id"] for r in conn.execute("SELECT id, name FROM idea_types")}
         rows = conn.execute(
-            "SELECT id, subject, category, subcategory FROM v_announcements "
+            f"SELECT id, subject, category, subcategory FROM {IDEA_SOURCE_VIEW} "
             "WHERE DATE(input_timestamp) BETWEEN ? AND ?",
             [str(date_start), str(date_end)],
         ).fetchall()
@@ -2068,112 +2134,142 @@ if page == "Announcements":
                 _log_search("BSE Equity", {"keyword": keyword, "category": be_cat, "subcategory": be_subcat, "from": str(from_date), "to": str(to_date)}, len(df_be))
 
         with be_sub_idb:
-            render_idea_board(DB_PATHS["BSE Equity"])
+            render_idea_board(DB_PATHS["BSE Equity"], "be", "BSE Equity")
 
         with be_sub_trk:
-            render_tracker(DB_PATHS["BSE Equity"])
+            render_tracker(DB_PATHS["BSE Equity"], "be")
 
     # ── BSE SME ───────────────────────────────────────────────────────────────
     with t_bs:
         _source_badge("BSE SME")
-        sme_view = st.radio("Table", ["Announcements", "Corp Actions"], horizontal=True, key="bsesme_view")
 
-        if sme_view == "Announcements":
-            df_bs = load_bse_sme_ann(from_date, to_date, keyword)
-            if df_bs.empty:
-                st.caption(f"{len(df_bs):,} record(s)")
-                st.info("No SME announcements found.")
+        bs_sub_ann, bs_sub_idb, bs_sub_trk = st.tabs(["📋 Announcements", "💡 Idea Board", "🗂️ Tracker"])
+
+        with bs_sub_ann:
+            sme_view = st.radio("Table", ["Announcements", "Corp Actions"], horizontal=True, key="bsesme_view")
+
+            if sme_view == "Announcements":
+                df_bs = load_bse_sme_ann(from_date, to_date, keyword)
+                if df_bs.empty:
+                    st.caption(f"{len(df_bs):,} record(s)")
+                    st.info("No SME announcements found.")
+                else:
+                    disp_bs = df_bs.rename(columns={"scrip_code":"Code","scrip_name":"Company","grp":"Group","category":"Category","announce_date":"Date","end_date":"End","purpose":"Purpose","attachment_url":"Document"})
+                    bs_settings = _report_settings(
+                        "bs_ann_table_cfg", list(disp_bs.columns), default_height=500,
+                        label=f"{len(df_bs):,} record(s)",
+                    )
+                    bs_view = _apply_report_settings(disp_bs, bs_settings)
+                    _, bs_height, _, _ = bs_settings
+
+                    ev2 = st.dataframe(
+                        bs_view, use_container_width=True, height=bs_height,
+                        on_select="rerun", selection_mode="multi-row", key="bs_ann_table",
+                        column_config={"Document": st.column_config.LinkColumn("Document", display_text="📄", width="small")},
+                    )
+                    for idx in (ev2.selection.rows if ev2 else []):
+                        _log_view("BSE SME", bs_view.iloc[idx].to_dict())
+                    st.download_button("⬇ Download CSV", df_bs.to_csv(index=False).encode(), "bse_sme_ann.csv", "text/csv")
             else:
-                disp_bs = df_bs.rename(columns={"scrip_code":"Code","scrip_name":"Company","grp":"Group","category":"Category","announce_date":"Date","end_date":"End","purpose":"Purpose","attachment_url":"Document"})
-                bs_settings = _report_settings(
-                    "bs_ann_table_cfg", list(disp_bs.columns), default_height=500,
-                    label=f"{len(df_bs):,} record(s)",
-                )
-                bs_view = _apply_report_settings(disp_bs, bs_settings)
-                _, bs_height, _, _ = bs_settings
+                df_bc = load_bse_sme_corp(from_date, to_date, keyword)
+                if df_bc.empty:
+                    st.caption(f"{len(df_bc):,} record(s)")
+                    st.info("No corp actions found.")
+                else:
+                    disp_bc = df_bc.rename(columns={"scrip_code":"Code","scrip_name":"Company","grp":"Group","category":"Category","ex_date":"Ex-Date","record_date":"Record Date","end_date":"End","purpose":"Purpose"})
+                    bc_settings = _report_settings(
+                        "bs_corp_table_cfg", list(disp_bc.columns), default_height=500,
+                        label=f"{len(df_bc):,} record(s)",
+                    )
+                    bc_view = _apply_report_settings(disp_bc, bc_settings)
+                    _, bc_height, _, _ = bc_settings
 
-                ev2 = st.dataframe(
-                    bs_view, use_container_width=True, height=bs_height,
-                    on_select="rerun", selection_mode="multi-row", key="bs_ann_table",
-                    column_config={"Document": st.column_config.LinkColumn("Document", display_text="📄", width="small")},
-                )
-                for idx in (ev2.selection.rows if ev2 else []):
-                    _log_view("BSE SME", bs_view.iloc[idx].to_dict())
-                st.download_button("⬇ Download CSV", df_bs.to_csv(index=False).encode(), "bse_sme_ann.csv", "text/csv")
-        else:
-            df_bc = load_bse_sme_corp(from_date, to_date, keyword)
-            if df_bc.empty:
-                st.caption(f"{len(df_bc):,} record(s)")
-                st.info("No corp actions found.")
-            else:
-                disp_bc = df_bc.rename(columns={"scrip_code":"Code","scrip_name":"Company","grp":"Group","category":"Category","ex_date":"Ex-Date","record_date":"Record Date","end_date":"End","purpose":"Purpose"})
-                bc_settings = _report_settings(
-                    "bs_corp_table_cfg", list(disp_bc.columns), default_height=500,
-                    label=f"{len(df_bc):,} record(s)",
-                )
-                bc_view = _apply_report_settings(disp_bc, bc_settings)
-                _, bc_height, _, _ = bc_settings
+                    st.dataframe(
+                        bc_view, use_container_width=True, height=bc_height, hide_index=True,
+                    )
+                    st.download_button("⬇ Download CSV", df_bc.to_csv(index=False).encode(), "bse_sme_corp.csv", "text/csv")
 
-                st.dataframe(
-                    bc_view, use_container_width=True, height=bc_height, hide_index=True,
-                )
-                st.download_button("⬇ Download CSV", df_bc.to_csv(index=False).encode(), "bse_sme_corp.csv", "text/csv")
+            _log_search("BSE SME", {"keyword": keyword, "from": str(from_date), "to": str(to_date)}, len(df_bs) if sme_view == "Announcements" else 0)
 
-        _log_search("BSE SME", {"keyword": keyword, "from": str(from_date), "to": str(to_date)}, len(df_bs) if sme_view == "Announcements" else 0)
+        with bs_sub_idb:
+            render_idea_board(DB_PATHS["BSE SME"], "bs", "BSE SME")
+
+        with bs_sub_trk:
+            render_tracker(DB_PATHS["BSE SME"], "bs")
 
     # ── NSE EQUITY ────────────────────────────────────────────────────────────
     with t_ne:
         _source_badge("NSE Equity")
-        ne_sub = st.text_input("Subject filter", "", key="ne_sub")
-        df_ne = load_nse("NSE Equity", from_date, to_date, keyword, ne_sub)
-        if df_ne.empty:
-            st.caption(f"{len(df_ne):,} record(s)")
-            st.info("No records found.")
-        else:
-            disp_ne = df_ne.rename(columns={"symbol":"Symbol","company_name":"Company","subject":"Subject","description":"Description","ann_date":"Date","attachment_url":"Document"})
-            ne_settings = _report_settings(
-                "ne_table_cfg", list(disp_ne.columns), default_height=500,
-                label=f"{len(df_ne):,} record(s)",
-            )
-            ne_view = _apply_report_settings(disp_ne, ne_settings)
-            _, ne_height, _, _ = ne_settings
 
-            ev3 = st.dataframe(
-                ne_view, use_container_width=True, height=ne_height,
-                on_select="rerun", selection_mode="multi-row", key="ne_table",
-                column_config={"Document": st.column_config.LinkColumn("Document", display_text="📄", width="small")},
-            )
-            for idx in (ev3.selection.rows if ev3 else []):
-                _log_view("NSE Equity", ne_view.iloc[idx].to_dict())
-            st.download_button("⬇ Download CSV", df_ne.to_csv(index=False).encode(), "nse_equity_results.csv", "text/csv")
-        _log_search("NSE Equity", {"keyword": keyword, "subject": ne_sub, "from": str(from_date), "to": str(to_date)}, len(df_ne))
+        ne_sub_ann, ne_sub_idb, ne_sub_trk = st.tabs(["📋 Announcements", "💡 Idea Board", "🗂️ Tracker"])
+
+        with ne_sub_ann:
+            ne_sub = st.text_input("Subject filter", "", key="ne_sub")
+            df_ne = load_nse("NSE Equity", from_date, to_date, keyword, ne_sub)
+            if df_ne.empty:
+                st.caption(f"{len(df_ne):,} record(s)")
+                st.info("No records found.")
+            else:
+                disp_ne = df_ne.rename(columns={"symbol":"Symbol","company_name":"Company","subject":"Subject","description":"Description","ann_date":"Date","attachment_url":"Document"})
+                ne_settings = _report_settings(
+                    "ne_table_cfg", list(disp_ne.columns), default_height=500,
+                    label=f"{len(df_ne):,} record(s)",
+                )
+                ne_view = _apply_report_settings(disp_ne, ne_settings)
+                _, ne_height, _, _ = ne_settings
+
+                ev3 = st.dataframe(
+                    ne_view, use_container_width=True, height=ne_height,
+                    on_select="rerun", selection_mode="multi-row", key="ne_table",
+                    column_config={"Document": st.column_config.LinkColumn("Document", display_text="📄", width="small")},
+                )
+                for idx in (ev3.selection.rows if ev3 else []):
+                    _log_view("NSE Equity", ne_view.iloc[idx].to_dict())
+                st.download_button("⬇ Download CSV", df_ne.to_csv(index=False).encode(), "nse_equity_results.csv", "text/csv")
+            _log_search("NSE Equity", {"keyword": keyword, "subject": ne_sub, "from": str(from_date), "to": str(to_date)}, len(df_ne))
+
+        with ne_sub_idb:
+            render_idea_board(DB_PATHS["NSE Equity"], "ne", "NSE Equity")
+
+        with ne_sub_trk:
+            render_tracker(DB_PATHS["NSE Equity"], "ne")
 
     # ── NSE SME ───────────────────────────────────────────────────────────────
     with t_ns:
         _source_badge("NSE SME")
-        ns_sub = st.text_input("Subject filter", "", key="ns_sub")
-        df_ns = load_nse("NSE SME", from_date, to_date, keyword, ns_sub)
-        if df_ns.empty:
-            st.caption(f"{len(df_ns):,} record(s)")
-            st.info("No records found.")
-        else:
-            disp_ns = df_ns.rename(columns={"symbol":"Symbol","company_name":"Company","subject":"Subject","description":"Description","ann_date":"Date","attachment_url":"Document"})
-            ns_settings = _report_settings(
-                "ns_table_cfg", list(disp_ns.columns), default_height=500,
-                label=f"{len(df_ns):,} record(s)",
-            )
-            ns_view = _apply_report_settings(disp_ns, ns_settings)
-            _, ns_height, _, _ = ns_settings
 
-            ev4 = st.dataframe(
-                ns_view, use_container_width=True, height=ns_height,
-                on_select="rerun", selection_mode="multi-row", key="ns_table",
-                column_config={"Document": st.column_config.LinkColumn("Document", display_text="📄", width="small")},
-            )
-            for idx in (ev4.selection.rows if ev4 else []):
-                _log_view("NSE SME", ns_view.iloc[idx].to_dict())
-            st.download_button("⬇ Download CSV", df_ns.to_csv(index=False).encode(), "nse_sme_results.csv", "text/csv")
-        _log_search("NSE SME", {"keyword": keyword, "subject": ns_sub, "from": str(from_date), "to": str(to_date)}, len(df_ns))
+        ns_sub_ann, ns_sub_idb, ns_sub_trk = st.tabs(["📋 Announcements", "💡 Idea Board", "🗂️ Tracker"])
+
+        with ns_sub_ann:
+            ns_sub = st.text_input("Subject filter", "", key="ns_sub")
+            df_ns = load_nse("NSE SME", from_date, to_date, keyword, ns_sub)
+            if df_ns.empty:
+                st.caption(f"{len(df_ns):,} record(s)")
+                st.info("No records found.")
+            else:
+                disp_ns = df_ns.rename(columns={"symbol":"Symbol","company_name":"Company","subject":"Subject","description":"Description","ann_date":"Date","attachment_url":"Document"})
+                ns_settings = _report_settings(
+                    "ns_table_cfg", list(disp_ns.columns), default_height=500,
+                    label=f"{len(df_ns):,} record(s)",
+                )
+                ns_view = _apply_report_settings(disp_ns, ns_settings)
+                _, ns_height, _, _ = ns_settings
+
+                ev4 = st.dataframe(
+                    ns_view, use_container_width=True, height=ns_height,
+                    on_select="rerun", selection_mode="multi-row", key="ns_table",
+                    column_config={"Document": st.column_config.LinkColumn("Document", display_text="📄", width="small")},
+                )
+                for idx in (ev4.selection.rows if ev4 else []):
+                    _log_view("NSE SME", ns_view.iloc[idx].to_dict())
+                st.download_button("⬇ Download CSV", df_ns.to_csv(index=False).encode(), "nse_sme_results.csv", "text/csv")
+            _log_search("NSE SME", {"keyword": keyword, "subject": ns_sub, "from": str(from_date), "to": str(to_date)}, len(df_ns))
+
+        with ns_sub_idb:
+            render_idea_board(DB_PATHS["NSE SME"], "ns", "NSE SME")
+
+        with ns_sub_trk:
+            render_tracker(DB_PATHS["NSE SME"], "ns")
 
     st.stop()
 
@@ -2990,8 +3086,8 @@ elif page == "Guided Activity":
     st.markdown(f"""<div class="page-head">
       <h1>🧭 Guided Activity</h1>
       <p>Run the pipeline end-to-end, right from the browser: scrape BSE/NSE announcements
-         (<code>market_announcements.py</code>), then score BSE Equity rows for "idea" categories
-         (<code>idea_rules.py</code>).</p>
+         (<code>market_announcements.py</code>), then score any source's rows for "idea" categories
+         (<code>idea_rules.py</code>) — BSE Equity, BSE SME, NSE Equity, or NSE SME.</p>
     </div>""", unsafe_allow_html=True)
 
     if not _SCRAPER_OK:
@@ -3025,8 +3121,6 @@ elif page == "Guided Activity":
             key="ga_src_select", label_visibility="collapsed",
         )
         P["sources"] = [label_to_key[l] for l in src_labels] or ["bse_equity"]
-        if "bse_equity" not in P["sources"]:
-            st.info("Idea scoring (step ③) only runs against **BSE Equity** rows — include it above if you want scored ideas afterwards.")
 
         st.markdown("**Date range**")
         dcol1, dcol2 = st.columns([1.4, 2])
@@ -3120,14 +3214,18 @@ elif page == "Guided Activity":
     # ═══════════════════════ ③ SCORE IDEAS ═══════════════════════
     with ga_tab3:
         st.caption(
-            "Scores **BSE Equity** rows against every idea type in `idea_rules.py` — same keyword / category-bonus / "
-            "negative-phrase rules the file documents — and writes results into the Idea Board tables."
+            "Scores the selected source's rows against every idea type in `idea_rules.py` — same keyword / "
+            "category-bonus / negative-phrase rules the file documents — and writes results into that source's "
+            "Idea Board tables."
         )
 
         if not _IDEA_RULES_OK:
             st.warning("idea_rules.py not available — scoring is disabled.")
+        elif not _IDEA_PIPELINE_OK:
+            st.warning(f"announcement_ideas_pipeline.py not available — scoring is disabled. Details: {_IDEA_PIPELINE_ERR}")
         else:
             st.session_state.setdefault("ga_score_params", {
+                "source":         "bse_equity",
                 "use_same_range": True,
                 "score_from": P["from_date"], "score_to": P["to_date"],
                 "groups": list(idea_rules.GROUPS),
@@ -3137,6 +3235,15 @@ elif page == "Guided Activity":
                 "force_rescore": False,
             })
             SP = st.session_state.ga_score_params
+
+            st.markdown("**Source to score**")
+            src_label_to_key = {v: k for k, v in GA_SOURCE_LABELS.items()}
+            score_src_label = st.selectbox(
+                "Source", list(GA_SOURCE_LABELS.values()),
+                index=list(GA_SOURCE_LABELS.keys()).index(SP["source"]),
+                key="ga_sp_source", label_visibility="collapsed",
+            )
+            SP["source"] = src_label_to_key[score_src_label]
 
             st.markdown("**Scoring window**")
             SP["use_same_range"] = st.checkbox(
@@ -3175,15 +3282,16 @@ elif page == "Guided Activity":
             )
 
             st.divider()
-            db_path = DB_PATHS["BSE Equity"]
+            score_label = GA_SOURCE_LABELS[SP["source"]]
+            db_path = DB_PATHS[score_label]
             if not Path(db_path).exists():
-                st.warning(f"`{db_path}` not found yet — run step ② (with BSE Equity selected) first.")
+                st.warning(f"`{db_path}` not found yet — run step ② (with **{score_label}** selected) first.")
             run_score = st.button(
                 "▶ Run scoring now", type="primary", key="ga_run_score",
                 disabled=not (Path(db_path).exists() and SP["types"]),
             )
             if run_score:
-                with st.spinner("Scoring BSE Equity announcements against the idea taxonomy …"):
+                with st.spinner(f"Scoring {score_label} announcements against the idea taxonomy …"):
                     ga_ensure_idea_tables(db_path)
                     summary = ga_score_announcements(
                         db_path, SP["score_from"], SP["score_to"],
@@ -3191,11 +3299,13 @@ elif page == "Guided Activity":
                         category_bonus=SP["category_bonus"], force_rescore=SP["force_rescore"],
                     )
                 st.session_state["ga_last_score"] = summary
+                st.session_state["ga_last_score_label"] = score_label
                 st.cache_data.clear()  # so the Idea Board picks up the new scores immediately
 
             summary = st.session_state.get("ga_last_score")
             if summary:
-                st.markdown("**Last run**")
+                ran_label = st.session_state.get("ga_last_score_label", score_label)
+                st.markdown(f"**Last run** — {ran_label}")
                 m1, m2, m3 = st.columns(3)
                 _metric(m1, f"{summary['rows_considered']:,}", "Rows considered")
                 _metric(m2, f"{summary['rows_matched']:,}",    "Rows matched ≥1 idea")
@@ -3205,6 +3315,6 @@ elif page == "Guided Activity":
                         sorted(summary["per_type"].items(), key=lambda x: -x[1]), columns=["Idea type", "Matches"]
                     )
                     st.dataframe(pt_df, hide_index=True, use_container_width=True, height=min(400, 40 + 35 * len(pt_df)))
-                st.success("Open **Announcements → BSE Equity → 💡 Idea Board** to browse the scored ideas.")
+                st.success(f"Open **Announcements → {ran_label} → 💡 Idea Board** to browse the scored ideas.")
             else:
                 st.info("No scoring run yet this session. Set parameters above then click **Run scoring now**.")
