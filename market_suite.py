@@ -1,5 +1,5 @@
 """
-bse_market_suite.py  —  Unified Indian Market Announcements Dashboard
+market_suite.py  —  Unified Indian Market Announcements Dashboard
 ═══════════════════════════════════════════════════════════════════════
 (Formerly market_web_report.py, now with the Idea Board embedded under
 the BSE Equity tab — see idea_board_streamlit_02.py, merged in below.)
@@ -27,7 +27,7 @@ Install (one-time):
     pip install streamlit pandas plotly anthropic streamlit-option-menu streamlit-authenticator
 
 Run:
-    streamlit run bse_market_suite.py
+    streamlit run market_suite.py
 
 Cron / unattended:
     The app reads the DBs read-only; run market_announcements.py and
@@ -2995,9 +2995,9 @@ elif page == "Guided Activity":
     </div>""", unsafe_allow_html=True)
 
     if not _SCRAPER_OK:
-        st.error(f"Couldn't import `market_announcements.py` — make sure it sits next to `bse_market_suite.py`. Details: {_SCRAPER_ERR}")
+        st.error(f"Couldn't import `market_announcements.py` — make sure it sits next to `market_suite.py`. Details: {_SCRAPER_ERR}")
     if not _IDEA_RULES_OK:
-        st.error(f"Couldn't import `idea_rules.py` — make sure it sits next to `bse_market_suite.py`. Details: {_IDEA_RULES_ERR}")
+        st.error(f"Couldn't import `idea_rules.py` — make sure it sits next to `market_suite.py`. Details: {_IDEA_RULES_ERR}")
 
     st.session_state.setdefault("ga_params", {
         "sources":        ["bse_equity"],
