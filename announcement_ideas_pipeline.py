@@ -225,27 +225,58 @@ def migrate(conn):
 
 def seed(conn):
     cur = conn.cursor()
+
+    # Check-then-insert/update rather than ON CONFLICT: a DB whose
+    # idea_groups/idea_types tables were created earlier by something else
+    # (e.g. market_suite.py's Guided Activity, which only uniques idea_types
+    # on `name`, not on (group_id, name)) won't have the exact constraint
+    # ON CONFLICT needs to target, and CREATE TABLE IF NOT EXISTS above
+    # doesn't retrofit one onto an existing table. This works regardless.
+    group_id = {}
     for i, gname in enumerate(GROUPS):
-        cur.execute(
-            "INSERT INTO idea_groups (name, sort_order) VALUES (?, ?) "
-            "ON CONFLICT(name) DO UPDATE SET sort_order=excluded.sort_order",
-            (gname, i),
-        )
+        row = cur.execute("SELECT id FROM idea_groups WHERE name = ?", (gname,)).fetchone()
+        if row:
+            gid = row[0]
+            cur.execute("UPDATE idea_groups SET sort_order = ? WHERE id = ?", (i, gid))
+        else:
+            cur.execute("INSERT INTO idea_groups (name, sort_order) VALUES (?, ?)", (gname, i))
+            gid = cur.lastrowid
+        group_id[gname] = gid
     conn.commit()
 
-    group_id = {r[0]: r[1] for r in cur.execute("SELECT name, id FROM idea_groups")}
-
+    # idea_type names are unique across the whole taxonomy (see idea_rules.py),
+    # so key off name alone rather than (group_id, name).
+    type_id = {}
     for j, (type_name, cfg) in enumerate(IDEA_TYPES.items()):
         gid = group_id[cfg["group"]]
-        cur.execute(
-            "INSERT INTO idea_types (group_id, name, description, sort_order) VALUES (?,?,?,?) "
-            "ON CONFLICT(group_id, name) DO UPDATE SET description=excluded.description, "
-            "sort_order=excluded.sort_order",
-            (gid, type_name, cfg["description"], j),
-        )
+        row = cur.execute("SELECT id FROM idea_types WHERE name = ?", (type_name,)).fetchone()
+        if row:
+            tid = row[0]
+            cur.execute(
+                "UPDATE idea_types SET group_id = ?, description = ?, sort_order = ? WHERE id = ?",
+                (gid, cfg["description"], j, tid),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO idea_types (group_id, name, description, sort_order) VALUES (?,?,?,?)",
+                (gid, type_name, cfg["description"], j),
+            )
+            tid = cur.lastrowid
+        type_id[type_name] = tid
     conn.commit()
 
-    type_id = {r[0]: r[1] for r in cur.execute("SELECT name, id FROM idea_types")}
+    # Best-effort: add real UNIQUE indexes going forward, if the data
+    # already in the tables allows it (silently skip if it doesn't — e.g.
+    # pre-existing duplicate names from before this fix).
+    for stmt in (
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_idea_groups_name ON idea_groups(name)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_idea_types_name ON idea_types(name)",
+    ):
+        try:
+            cur.execute(stmt)
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
     cur.execute("DELETE FROM idea_keyword_rules")  # rules always re-seeded from idea_rules.py
     for type_name, cfg in IDEA_TYPES.items():

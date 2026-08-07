@@ -1057,10 +1057,11 @@ def render_idea_board(db_path: str, kp: str, source_label: str = ""):
 
     try:
         groups, types = idb_get_meta(str(idb_db_file), idb_mtime)
-    except sqlite3.OperationalError as e:
+    except (sqlite3.OperationalError, pd.errors.DatabaseError) as e:
         st.error(
             f"`{idb_db_path}` doesn't have the idea-board tables yet. Run:\n\n"
             f"`python3 announcement_ideas_pipeline.py --db {idb_db_path} run`\n\n"
+            f"(or use **Guided Activity → ③ Score ideas**, with **Source** set to this one)\n\n"
             f"Details: {e}"
         )
         return
