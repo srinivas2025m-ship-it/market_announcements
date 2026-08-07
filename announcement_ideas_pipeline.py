@@ -24,6 +24,16 @@ Usage:
     python3 announcement_ideas_pipeline.py --db bse_equity.db seed
     python3 announcement_ideas_pipeline.py --db bse_equity.db classify
 
+    # transparency report: per idea-type counts, score distribution, top
+    # matched phrase, and a flag on "weak" (single-keyword) matches:
+    python3 announcement_ideas_pipeline.py --db bse_equity.db report
+    python3 announcement_ideas_pipeline.py --db bse_equity.db report --from 2026-06-01 --to 2026-06-30
+
+    # live per-announcement trace while classifying (shows every idea type
+    # tested, what matched/didn't, the raw/cap/score math, and the outcome):
+    python3 announcement_ideas_pipeline.py --db bse_equity.db classify --showideageneration
+    python3 announcement_ideas_pipeline.py --db bse_equity.db run --showideageneration --from 2026-06-01 --to 2026-06-30
+
     # optional JSON export (only needed for the standalone idea_board.html artifact):
     python3 announcement_ideas_pipeline.py --db bse_equity.db --out ideas_export.json export
     python3 announcement_ideas_pipeline.py --db bse_equity.db --out ideas_export.json run --export
@@ -61,17 +71,20 @@ from idea_rules import IDEA_TYPES, GROUPS, CATEGORY_BONUS_WEIGHT, MIN_SCORE_THRE
 # pipeline invocation (`--db <any of the 4 dbs> run`) works everywhere.
 SOURCE_VIEW = "v_idea_source"
 
+# FIX: previously assumed ann_date was "DD-Mon-YYYY HH:MM:SS" (3-letter month
+# name) and did a name lookup. market_announcements.py's own nse_query()
+# (the code that already successfully powers `query`/`report` against these
+# same DBs) treats ann_date as numeric "DD-MM-YYYY HH:MM:SS" instead
+# (substr(ann_date,4,2) with no name mapping). The name-lookup version was
+# silently producing garbage ISO strings (e.g. "026 -00-2823:26:37") against
+# the real numeric data, which breaks --from/--to filtering and any
+# timestamp display for NSE-sourced announcements. Aligned to match
+# nse_query()'s (already-working) assumption.
 _NSE_DATE_TO_ISO = """
     (CASE
-       WHEN length(ann_date) >= 11 THEN
-         substr(ann_date,8,4)||'-'||
-         CASE substr(ann_date,4,3)
-           WHEN 'Jan' THEN '01' WHEN 'Feb' THEN '02' WHEN 'Mar' THEN '03'
-           WHEN 'Apr' THEN '04' WHEN 'May' THEN '05' WHEN 'Jun' THEN '06'
-           WHEN 'Jul' THEN '07' WHEN 'Aug' THEN '08' WHEN 'Sep' THEN '09'
-           WHEN 'Oct' THEN '10' WHEN 'Nov' THEN '11' WHEN 'Dec' THEN '12'
-           ELSE '00' END||'-'||
-         substr(ann_date,1,2)||substr(ann_date,12)
+       WHEN length(ann_date) >= 10 THEN
+         substr(ann_date,7,4)||'-'||substr(ann_date,4,2)||'-'||substr(ann_date,1,2)
+         || substr(ann_date,11)
        ELSE ann_date
      END)
 """
@@ -333,7 +346,7 @@ def _cap_for(cfg):
     return max(top2, 2.0)
 
 
-def classify(conn, recompute=False, date_from=None, date_to=None):
+def classify(conn, recompute=False, date_from=None, date_to=None, show=False):
     cur = conn.cursor()
     ensure_source_view(conn)
     source = SOURCE_VIEW
@@ -349,7 +362,9 @@ def classify(conn, recompute=False, date_from=None, date_to=None):
         else:
             cur.execute("DELETE FROM announcement_idea_scores")
 
-    base_sql = f"SELECT id, subject, category, subcategory FROM {source}"
+    # company_name/symbol are only needed for the --showideageneration trace,
+    # but selecting them is cheap so we always pull them for a simpler query.
+    base_sql = f"SELECT id, company_name, symbol, subject, category, subcategory FROM {source}"
     sql, params = _apply_date_filter(base_sql, [], date_from, date_to)
     rows = cur.execute(sql, params).fetchall()
 
@@ -358,21 +373,39 @@ def classify(conn, recompute=False, date_from=None, date_to=None):
         already_scored = {r[0] for r in cur.execute("SELECT DISTINCT announcement_id FROM announcement_idea_scores")}
 
     inserted = 0
-    for ann_id, subject, category, subcategory in rows:
+    for ann_id, company_name, symbol, subject, category, subcategory in rows:
         if ann_id in already_scored:
+            if show:
+                print(f"\n[id {ann_id}] {symbol or '-'} {(subject or '')[:70]!r} -- already scored, skipped "
+                      f"(use --recompute to re-run)")
             continue
+
         subj = f" {(subject or '').lower()} "
         cat_text = f"{(category or '')} {(subcategory or '')}".lower()
 
+        if show:
+            print(f"\n[id {ann_id}] {symbol or '-'} {company_name or ''}")
+            print(f"  subject: {subject!r}")
+            if category or subcategory:
+                print(f"  category/subcategory: {category!r} / {subcategory!r}")
+
+        ann_had_match = False
         for type_name, cfg in IDEA_TYPES.items():
             raw = 0.0
             matched = []
-            disqualified = False
+            neg_hit = None
             for phrase in cfg.get("negative", []):
                 if phrase in subj:
-                    disqualified = True
+                    neg_hit = phrase
                     break
-            if disqualified:
+            if neg_hit:
+                if show:
+                    # only worth mentioning if a positive keyword would otherwise
+                    # have fired -- avoids printing a disqualification line for
+                    # every idea type that was never going to match anyway.
+                    would_match = any(p in subj for p, _ in cfg["keywords"])
+                    if would_match:
+                        print(f"  -> {type_name}: DISQUALIFIED (negative phrase {neg_hit!r} found)")
                 continue
 
             for phrase, weight in cfg["keywords"]:
@@ -391,6 +424,9 @@ def classify(conn, recompute=False, date_from=None, date_to=None):
 
             score = round(min(100.0, raw / caps[type_name] * 100.0), 1)
             if score < MIN_SCORE_THRESHOLD:
+                if show:
+                    print(f"  -> {type_name}: below threshold  raw={raw} cap={caps[type_name]} "
+                          f"score={score} (< {MIN_SCORE_THRESHOLD})  matched={matched}")
                 continue
 
             cur.execute(
@@ -402,6 +438,14 @@ def classify(conn, recompute=False, date_from=None, date_to=None):
                 (ann_id, type_id[type_name], score, json.dumps(matched)),
             )
             inserted += 1
+            ann_had_match = True
+            if show:
+                print(f"  -> {type_name}: MATCHED  raw={raw} cap={caps[type_name]} score={score}  "
+                      f"matched={matched}  [RECORDED]")
+
+        if show and not ann_had_match:
+            print("  -> no idea type matched")
+
     conn.commit()
     print(f"[classify] scored {len(rows)} announcements, {inserted} idea matches recorded.")
 
@@ -448,6 +492,69 @@ def export(conn, out_path, date_from=None, date_to=None):
         json.dump(result, f, indent=2)
     total_items = sum(t["count"] for g in result["groups"] for t in g["types"])
     print(f"[export] wrote {out_path} ({total_items} idea matches across {len(IDEA_TYPES)} idea types).")
+
+
+def report(conn, date_from=None, date_to=None, min_matches_shown=5):
+    """
+    Transparency/reporting command: for each idea type, shows how many
+    announcements were flagged, the score distribution, and — most
+    importantly — how many of those matches are "weak" (a single matched
+    keyword and no category-hint bonus), so you can see at a glance which
+    ideas are backed by strong multi-signal evidence vs. one borderline
+    keyword. Also prints the single most common matched phrase per idea
+    type, so you can sanity-check what's actually driving each bucket.
+    """
+    cur = conn.cursor()
+    ensure_source_view(conn)
+
+    base_sql = f"""
+        SELECT it.name, g.name, s.score, s.matched_keywords
+        FROM announcement_idea_scores s
+        JOIN idea_types it ON it.id = s.idea_type_id
+        JOIN idea_groups g ON g.id = it.group_id
+        JOIN {SOURCE_VIEW} a ON a.id = s.announcement_id
+    """
+    sql, params = _apply_date_filter(base_sql, [], date_from, date_to)
+    rows = cur.execute(sql, params).fetchall()
+
+    if not rows:
+        print("[report] no idea matches found for the given range.")
+        return
+
+    by_type = {}
+    for type_name, group_name, score, matched_json in rows:
+        matched = json.loads(matched_json) if matched_json else []
+        d = by_type.setdefault(type_name, {"group": group_name, "scores": [], "phrase_counts": {}, "weak": 0})
+        d["scores"].append(score)
+        # "weak" = exactly one signal fired and it wasn't the category bonus
+        real_phrases = [p for p in matched if not p.startswith("[category]")]
+        if len(matched) <= 1 and not any(p.startswith("[category]") for p in matched):
+            d["weak"] += 1
+        for p in real_phrases:
+            d["phrase_counts"][p] = d["phrase_counts"].get(p, 0) + 1
+
+    total_matches = len(rows)
+    total_weak = sum(d["weak"] for d in by_type.values())
+    span = f" ({date_from or '...'} to {date_to or '...'})" if (date_from or date_to) else ""
+    print(f"\n=== Idea Generation Report{span} ===")
+    print(f"{total_matches} idea matches across {len(by_type)} idea types "
+          f"({total_weak} flagged weak — single keyword, no category-hint bonus)\n")
+
+    for type_name, d in sorted(by_type.items(), key=lambda kv: -len(kv[1]["scores"])):
+        scores = d["scores"]
+        n = len(scores)
+        avg = round(sum(scores) / n, 1)
+        top_phrase = max(d["phrase_counts"].items(), key=lambda kv: kv[1])[0] if d["phrase_counts"] else "(category hint only)"
+        flag = f"  ⚠ {d['weak']} weak" if d["weak"] else ""
+        print(f"  [{d['group']}] {type_name}: {n} matches, avg score {avg}, "
+              f"score range {min(scores)}-{max(scores)}, top signal: \"{top_phrase}\"{flag}")
+
+    if total_weak:
+        print(f"\n  Tip: weak matches are worth a manual glance — a single generic keyword "
+              f"(e.g. a bare 'merger', 'ceo', 'promoter') can fire without real category support. "
+              f"Consider tightening idea_rules.py negatives/weights for the flagged types above, "
+              f"or raise MIN_SCORE_THRESHOLD.")
+    print()
 
 
 def build_demo_db(path):
@@ -567,7 +674,12 @@ def main():
                      help="only process announcements with input_timestamp >= this date (inclusive)")
     ap.add_argument("--to", dest="date_to", metavar="YYYY-MM-DD", default=None,
                      help="only process announcements with input_timestamp <= this date (inclusive)")
-    ap.add_argument("command", choices=["migrate", "seed", "classify", "export", "run", "demo"])
+    ap.add_argument("--showideageneration", action="store_true",
+                     help="live trace during classify/run: prints each announcement's subject, "
+                          "which idea types it was tested against, which keywords/negatives/category "
+                          "hints fired, the raw/cap/score math, and whether it was recorded, filtered "
+                          "by threshold, or disqualified.")
+    ap.add_argument("command", choices=["migrate", "seed", "classify", "export", "run", "demo", "report"])
     args = ap.parse_args()
 
     for label, value in (("--from", args.date_from), ("--to", args.date_to)):
@@ -589,16 +701,20 @@ def main():
     elif args.command == "seed":
         seed(conn)
     elif args.command == "classify":
-        classify(conn, recompute=args.recompute, date_from=args.date_from, date_to=args.date_to)
+        classify(conn, recompute=args.recompute, date_from=args.date_from, date_to=args.date_to,
+                 show=args.showideageneration)
     elif args.command == "export":
         export(conn, args.out, date_from=args.date_from, date_to=args.date_to)
+    elif args.command == "report":
+        report(conn, date_from=args.date_from, date_to=args.date_to)
     elif args.command == "run":
         # migrate + seed + classify write everything straight into --db.
         # No JSON file is produced unless --export is passed: the DB is
         # the single source of truth that the Streamlit report reads from.
         migrate(conn)
         seed(conn)
-        classify(conn, recompute=args.recompute, date_from=args.date_from, date_to=args.date_to)
+        classify(conn, recompute=args.recompute, date_from=args.date_from, date_to=args.date_to,
+                 show=args.showideageneration)
         if args.export:
             export(conn, args.out, date_from=args.date_from, date_to=args.date_to)
 
