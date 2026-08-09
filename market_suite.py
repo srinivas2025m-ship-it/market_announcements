@@ -2712,22 +2712,51 @@ def ga_score_announcements(db_path: str, date_start, date_end, idea_type_names=N
 # Which table(s) hold dated rows for each source, which column holds the
 # date, and which child tables (same DB file, FK'd on announcement_id) must
 # be purged first when their parent "announcements" rows disappear.
+#
+# IMPORTANT: date formats differ per source, so each entry carries a
+# "date_expr" — the exact SQL expression that normalizes that column to
+# 'YYYY-MM-DD' for a BETWEEN comparison. BSE Equity's input_timestamp and
+# BSE SME's announce_date/ex_date are already ISO text, so a plain DATE()
+# wrapper works. NSE's ann_date is stored as "28-Jun-2026 23:26:37" (from
+# market_announcements.py's nse_store()) — DATE() on that returns NULL and
+# silently matches nothing, so it needs the same day/mon/year CASE rebuild
+# that load_nse() above already uses for the Announcements page, kept
+# character-for-character identical so both places agree on what "today"
+# means for an NSE row.
+_DBC_NSE_DATE_EXPR = """(CASE
+   WHEN length(ann_date) >= 11 THEN
+     substr(ann_date,8,4)||'-'||
+     CASE substr(ann_date,4,3)
+       WHEN 'Jan' THEN '01' WHEN 'Feb' THEN '02' WHEN 'Mar' THEN '03'
+       WHEN 'Apr' THEN '04' WHEN 'May' THEN '05' WHEN 'Jun' THEN '06'
+       WHEN 'Jul' THEN '07' WHEN 'Aug' THEN '08' WHEN 'Sep' THEN '09'
+       WHEN 'Oct' THEN '10' WHEN 'Nov' THEN '11' WHEN 'Dec' THEN '12'
+       ELSE '00' END||'-'||
+     substr(ann_date,1,2)
+   ELSE ann_date
+ END)"""
+
 DBC_SOURCE_TABLES = {
     "BSE Equity": [
-        {"table": "announcements", "date_col": "input_timestamp", "label": "Announcements",
+        {"table": "announcements", "date_col": "input_timestamp", "date_expr": "DATE(input_timestamp)",
+         "label": "Announcements",
          "children": ["announcement_idea_scores", "announcement_notes", "announcement_status", "watchlist"]},
     ],
     "BSE SME": [
-        {"table": "announcements", "date_col": "announce_date", "label": "Announcements",
+        {"table": "announcements", "date_col": "announce_date", "date_expr": "DATE(announce_date)",
+         "label": "Announcements",
          "children": ["announcement_idea_scores", "announcement_notes", "announcement_status", "watchlist"]},
-        {"table": "corp_actions", "date_col": "ex_date", "label": "Corp Actions", "children": []},
+        {"table": "corp_actions", "date_col": "ex_date", "date_expr": "DATE(ex_date)",
+         "label": "Corp Actions", "children": []},
     ],
     "NSE Equity": [
-        {"table": "announcements", "date_col": "ann_date", "label": "Announcements",
+        {"table": "announcements", "date_col": "ann_date", "date_expr": _DBC_NSE_DATE_EXPR,
+         "label": "Announcements",
          "children": ["announcement_idea_scores", "announcement_notes", "announcement_status", "watchlist"]},
     ],
     "NSE SME": [
-        {"table": "announcements", "date_col": "ann_date", "label": "Announcements",
+        {"table": "announcements", "date_col": "ann_date", "date_expr": _DBC_NSE_DATE_EXPR,
+         "label": "Announcements",
          "children": ["announcement_idea_scores", "announcement_notes", "announcement_status", "watchlist"]},
     ],
 }
@@ -2764,7 +2793,7 @@ def _dbc_quote_path(path: str) -> str:
     return str(path).replace("'", "''")
 
 
-def dbc_count_matches(db_path: str, table: str, date_col: str, date_start, date_end) -> int:
+def dbc_count_matches(db_path: str, table: str, date_expr: str, date_start, date_end) -> int:
     """Dry-run row count for one table within [date_start, date_end] inclusive."""
     if not db_path or not Path(db_path).exists():
         return 0
@@ -2773,7 +2802,7 @@ def dbc_count_matches(db_path: str, table: str, date_col: str, date_start, date_
         if not _dbc_table_exists(conn, table):
             return 0
         row = conn.execute(
-            f"SELECT COUNT(*) FROM {table} WHERE DATE({date_col}) BETWEEN ? AND ?",
+            f"SELECT COUNT(*) FROM {table} WHERE {date_expr} BETWEEN ? AND ?",
             (str(date_start), str(date_end)),
         ).fetchone()
         return int(row[0]) if row else 0
@@ -2783,7 +2812,7 @@ def dbc_count_matches(db_path: str, table: str, date_col: str, date_start, date_
         conn.close()
 
 
-def dbc_count_children(db_path: str, ann_table: str, date_col: str, date_start, date_end, children: list) -> dict:
+def dbc_count_children(db_path: str, ann_table: str, date_expr: str, date_start, date_end, children: list) -> dict:
     """For each child table FK'd on announcement_id, count rows that would be
     cascaded away if the matching parent rows were deleted."""
     out = {c: 0 for c in children}
@@ -2799,7 +2828,7 @@ def dbc_count_children(db_path: str, ann_table: str, date_col: str, date_start, 
             try:
                 row = conn.execute(
                     f"SELECT COUNT(*) FROM {child} WHERE announcement_id IN "
-                    f"(SELECT id FROM {ann_table} WHERE DATE({date_col}) BETWEEN ? AND ?)",
+                    f"(SELECT id FROM {ann_table} WHERE {date_expr} BETWEEN ? AND ?)",
                     (str(date_start), str(date_end)),
                 ).fetchone()
                 out[child] = int(row[0]) if row else 0
@@ -2824,14 +2853,18 @@ def dbc_count_tracker_links(scope_sources: list, date_start, date_end) -> int:
         for label in scope_sources:
             src_db = DB_PATHS.get(label)
             fmap = AT_SOURCE_FIELD_MAP.get(label)
-            if not src_db or not fmap or not Path(src_db).exists():
+            cfg = next((t for t in DBC_SOURCE_TABLES.get(label, []) if t["table"] == "announcements"), None)
+            if not src_db or not fmap or not cfg or not Path(src_db).exists():
                 continue
             try:
                 conn.execute(f"ATTACH DATABASE '{_dbc_quote_path(src_db)}' AS dbc_src")
+                # date_expr references bare column names (e.g. "ann_date") which
+                # resolve fine against the attached table since it's the only
+                # table in that subquery's scope.
                 row = conn.execute(
                     f"SELECT COUNT(*) FROM announcement_tracker t WHERE t.source = ? "
                     f"AND t.source_announcement_id IN "
-                    f"(SELECT id FROM dbc_src.{fmap['table']} WHERE DATE({fmap['date']}) BETWEEN ? AND ?)",
+                    f"(SELECT id FROM dbc_src.{fmap['table']} WHERE {cfg['date_expr']} BETWEEN ? AND ?)",
                     (label, str(date_start), str(date_end)),
                 ).fetchone()
                 total += int(row[0]) if row else 0
@@ -2857,10 +2890,10 @@ def dbc_build_preview(scope: dict, date_start, date_end, cascade_tracker: bool) 
             cfg = cfg_by_table.get(table)
             if not cfg:
                 continue
-            n = dbc_count_matches(db_path, table, cfg["date_col"], date_start, date_end)
+            n = dbc_count_matches(db_path, table, cfg["date_expr"], date_start, date_end)
             linked = 0
             if cfg["children"] and n:
-                linked = sum(dbc_count_children(db_path, table, cfg["date_col"], date_start, date_end, cfg["children"]).values())
+                linked = sum(dbc_count_children(db_path, table, cfg["date_expr"], date_start, date_end, cfg["children"]).values())
             rows.append({"Source": label, "Table": cfg["label"], "Matching rows": n, "Linked idea/tracker rows": linked})
     df = pd.DataFrame(rows, columns=["Source", "Table", "Matching rows", "Linked idea/tracker rows"])
     if cascade_tracker:
@@ -2903,9 +2936,9 @@ def dbc_run_cleanup(scope: dict, date_start, date_end, cascade_tracker: bool, va
                 cfg = cfg_by_table.get(table)
                 if not cfg or not _dbc_table_exists(conn, table):
                     continue
-                date_col = cfg["date_col"]
+                date_expr = cfg["date_expr"]
                 ann_ids = [r[0] for r in conn.execute(
-                    f"SELECT id FROM {table} WHERE DATE({date_col}) BETWEEN ? AND ?",
+                    f"SELECT id FROM {table} WHERE {date_expr} BETWEEN ? AND ?",
                     (str(date_start), str(date_end)),
                 ).fetchall()]
                 child_deleted = {}
@@ -2917,7 +2950,7 @@ def dbc_run_cleanup(scope: dict, date_start, date_end, cascade_tracker: bool, va
                         cur = conn.execute(f"DELETE FROM {child} WHERE announcement_id IN ({placeholders})", ann_ids)
                         child_deleted[child] = cur.rowcount
                 cur = conn.execute(
-                    f"DELETE FROM {table} WHERE DATE({date_col}) BETWEEN ? AND ?",
+                    f"DELETE FROM {table} WHERE {date_expr} BETWEEN ? AND ?",
                     (str(date_start), str(date_end)),
                 )
                 per_source.append({
