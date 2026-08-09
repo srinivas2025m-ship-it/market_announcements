@@ -1842,6 +1842,18 @@ def render_tracker(db_path: str, kp: str):
 
     try:
         _trk_init_db(db_path)
+        at_init_db()  # FIX: ensure the cross-source announcement_tracker.db
+                      # schema exists too — at_is_tracked() (called by
+                      # trk_render_search_page below) queries it directly,
+                      # but until now it was only initialized by visiting the
+                      # separate "Announcement Tracker" sidebar page first.
+                      # On a fresh environment (e.g. right after Guided
+                      # Activity's scrape+score steps, before ever opening
+                      # that page), this per-source Tracker sub-tab crashed
+                      # with "no such table: announcement_tracker" — an
+                      # uncaught exception that aborted the rest of the
+                      # script, which is why the Idea Board sub-tab rendered
+                      # just above it could look "broken" too.
     except Exception as e:
         st.error(f"Could not initialize tracker tables: {e}")
         return
