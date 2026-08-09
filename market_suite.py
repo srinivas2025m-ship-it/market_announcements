@@ -1465,6 +1465,55 @@ def _trk_do_toggle_watchlist(db_path, ann_id, in_wl, company_name, symbol, scrip
         _trk_add_to_watchlist(db_path, ann_id, company_name, symbol, scrip_code, subject)
 
 
+# ── Track (Tracker sub-tab row action) ───────────────────────────────────────
+# Replaces the old ⭐ Add-to-Watchlist button. One click, one row: embeds
+# at_track_announcement()'s company-master ↔ tracked-announcement (1:N) logic
+# directly on that single announcement — never the whole result set.
+
+TRK_KP_TO_SOURCE = {"be": "BSE Equity", "bs": "BSE SME", "ne": "NSE Equity", "ns": "NSE SME"}
+
+
+def _trk_build_track_payload(kp: str, row: dict):
+    """Translates one row from the Tracker tab's normalized query (columns:
+    id, company_name, symbol, scrip_code, category, subcategory, subject,
+    input_timestamp, attachment_url) into the raw field names
+    at_track_announcement expects for this source, per AT_SOURCE_FIELD_MAP.
+    Returns (source_label, payload_dict) for a SINGLE record only."""
+    source = TRK_KP_TO_SOURCE.get(kp, "BSE Equity")
+    cfg = AT_SOURCE_FIELD_MAP[source]
+    payload = {"id": row.get("id")}
+    if cfg["company"]:
+        payload[cfg["company"]] = row.get("company_name")
+    if cfg["code"]:
+        payload[cfg["code"]] = row.get("scrip_code") or row.get("symbol")
+    if cfg["bse"]:
+        payload[cfg["bse"]] = row.get("scrip_code")
+    if cfg["nse"]:
+        payload[cfg["nse"]] = row.get("symbol")
+    if cfg["category"]:
+        payload[cfg["category"]] = row.get("category")
+    if cfg["subcategory"]:
+        payload[cfg["subcategory"]] = row.get("subcategory")
+    if cfg["subject"]:
+        payload[cfg["subject"]] = row.get("subject")
+    if cfg["link"]:
+        payload[cfg["link"]] = row.get("attachment_url")
+    if cfg["date"]:
+        payload[cfg["date"]] = row.get("input_timestamp")
+    return source, payload
+
+
+def _trk_do_track_single(kp, ann_id, company_name, symbol, scrip_code, category, subcategory, subject, attachment_url, input_timestamp):
+    """Tracks exactly this one announcement — finds/creates its company
+    master and inserts one tracker row (1:N). No bulk/selection involved."""
+    source, payload = _trk_build_track_payload(kp, {
+        "id": ann_id, "company_name": company_name, "symbol": symbol, "scrip_code": scrip_code,
+        "category": category, "subcategory": subcategory, "subject": subject,
+        "attachment_url": attachment_url, "input_timestamp": input_timestamp,
+    })
+    at_track_announcement(source, payload)
+
+
 def trk_render_search_page(db_path: str, kp: str):
     categories_df = _trk_get_categories(db_path)
     idea_types_df = _trk_get_idea_types(db_path)
@@ -1554,7 +1603,6 @@ def trk_render_search_page(db_path: str, kp: str):
 
     status_map = _trk_get_status_map(db_path)
     note_counts = _trk_get_note_counts(db_path)
-    watchlist_ids = _trk_get_watchlist_ids(db_path)
 
     if status_filter != "Any":
         wanted_ids = [k for k, v in status_map.items() if v == status_filter]
@@ -1608,7 +1656,7 @@ def trk_render_search_page(db_path: str, kp: str):
                     on_click=_trk_cancel_delete, args=(kp,), use_container_width=True,
                 )
         else:
-            in_wl = ann_id in watchlist_ids
+            already_tracked = at_is_tracked(TRK_KP_TO_SOURCE.get(kp, "BSE Equity"), ann_id)
             with cols[6]:
                 ac1, ac2, ac3 = st.columns(3)
                 ac1.button(
@@ -1620,12 +1668,15 @@ def trk_render_search_page(db_path: str, kp: str):
                     on_click=_trk_ask_confirm_delete, args=(kp, ann_id), use_container_width=True,
                 )
                 ac3.button(
-                    "⭐" if not in_wl else "★",
-                    key=f"{kp}_trk_wl_{ann_id}",
-                    help="Remove from Watchlist" if in_wl else "Add to Watchlist",
-                    on_click=_trk_do_toggle_watchlist,
-                    args=(db_path, ann_id, in_wl, row["company_name"], row["symbol"], row["scrip_code"], row["subject"]),
+                    "✅" if already_tracked else "📌",
+                    key=f"{kp}_trk_track_{ann_id}",
+                    help="Already tracked (Company master ↔ tracker)" if already_tracked else "Track this announcement → Company master",
+                    on_click=_trk_do_track_single,
+                    args=(kp, ann_id, row["company_name"], row["symbol"], row["scrip_code"],
+                          row["category"], row["subcategory"], row["subject"],
+                          row["attachment_url"], row["input_timestamp"]),
                     use_container_width=True,
+                    disabled=already_tracked,
                 )
         st.divider()
 
@@ -2757,40 +2808,7 @@ if page == "Announcements":
                 for idx in (ev.selection.rows if ev else []):
                     _log_view("BSE Equity", be_view.iloc[idx].to_dict())
 
-                # ── One-click Track — acts on whatever rows are selected in the
-                # grid above (native st.dataframe row selection), no extra
-                # expander/click needed. Maps the selected display rows back
-                # to their raw df_be rows (same pandas index, since `disp` was
-                # only renamed/column-dropped, never re-indexed) so
-                # at_track_announcement gets the original id/field names it
-                # needs to find-or-create the company master and insert the
-                # tracker row (1:N).
-                sel_positions = list(ev.selection.rows) if ev else []
-                if sel_positions:
-                    sel_idx = be_view.iloc[sel_positions].index
-                    sel_raw = df_be.loc[sel_idx]
-                    already_n = sum(at_is_tracked("BSE Equity", r.get("id")) for _, r in sel_raw.iterrows())
-                    new_n = len(sel_raw) - already_n
-                    trk_l, trk_r = st.columns([3, 1.4])
-                    trk_l.caption(
-                        f"**{len(sel_raw)} row(s) selected** · {already_n} already tracked · {new_n} new"
-                    )
-                    if trk_r.button(
-                        "📌 Track selected → Master", key="be_track_selected", type="primary",
-                        use_container_width=True, disabled=(new_n == 0),
-                    ):
-                        created = 0
-                        for _, r in sel_raw.iterrows():
-                            if at_track_announcement("BSE Equity", r.to_dict()) is not None:
-                                created += 1
-                        st.success(
-                            f"Tracked {created} new announcement(s) — company master created/linked automatically. "
-                            "See the 🗂️ Tracker sub-tab or the Announcement Tracker page."
-                        )
-                        st.rerun()
-
                 st.download_button("⬇ Download CSV", df_be.to_csv(index=False).encode(), "bse_equity_results.csv", "text/csv")
-                at_render_row_actions(df_be, "BSE Equity", "be")
                 _log_search("BSE Equity", {"keyword": keyword, "category": be_cat, "subcategory": be_subcat, "from": str(from_date), "to": str(to_date)}, len(df_be))
 
         with be_sub_idb:
