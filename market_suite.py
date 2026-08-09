@@ -2757,6 +2757,38 @@ if page == "Announcements":
                 for idx in (ev.selection.rows if ev else []):
                     _log_view("BSE Equity", be_view.iloc[idx].to_dict())
 
+                # ── One-click Track — acts on whatever rows are selected in the
+                # grid above (native st.dataframe row selection), no extra
+                # expander/click needed. Maps the selected display rows back
+                # to their raw df_be rows (same pandas index, since `disp` was
+                # only renamed/column-dropped, never re-indexed) so
+                # at_track_announcement gets the original id/field names it
+                # needs to find-or-create the company master and insert the
+                # tracker row (1:N).
+                sel_positions = list(ev.selection.rows) if ev else []
+                if sel_positions:
+                    sel_idx = be_view.iloc[sel_positions].index
+                    sel_raw = df_be.loc[sel_idx]
+                    already_n = sum(at_is_tracked("BSE Equity", r.get("id")) for _, r in sel_raw.iterrows())
+                    new_n = len(sel_raw) - already_n
+                    trk_l, trk_r = st.columns([3, 1.4])
+                    trk_l.caption(
+                        f"**{len(sel_raw)} row(s) selected** · {already_n} already tracked · {new_n} new"
+                    )
+                    if trk_r.button(
+                        "📌 Track selected → Master", key="be_track_selected", type="primary",
+                        use_container_width=True, disabled=(new_n == 0),
+                    ):
+                        created = 0
+                        for _, r in sel_raw.iterrows():
+                            if at_track_announcement("BSE Equity", r.to_dict()) is not None:
+                                created += 1
+                        st.success(
+                            f"Tracked {created} new announcement(s) — company master created/linked automatically. "
+                            "See the 🗂️ Tracker sub-tab or the Announcement Tracker page."
+                        )
+                        st.rerun()
+
                 st.download_button("⬇ Download CSV", df_be.to_csv(index=False).encode(), "bse_equity_results.csv", "text/csv")
                 at_render_row_actions(df_be, "BSE Equity", "be")
                 _log_search("BSE Equity", {"keyword": keyword, "category": be_cat, "subcategory": be_subcat, "from": str(from_date), "to": str(to_date)}, len(df_be))
