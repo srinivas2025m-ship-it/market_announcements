@@ -338,59 +338,105 @@ def _apply_date_filter(base_sql, params, date_from=None, date_to=None):
     return sql, params
 
 
-def _cap_for(cfg):
+def _cap_for(cfg, category_bonus=None):
+    bonus = CATEGORY_BONUS_WEIGHT if category_bonus is None else category_bonus
     weights = sorted([w for _, w in cfg["keywords"]], reverse=True)
     top2 = sum(weights[:2]) if weights else 2.0
     if cfg.get("category_hints"):
-        top2 += CATEGORY_BONUS_WEIGHT
+        top2 += bonus
     return max(top2, 2.0)
 
 
-def classify(conn, recompute=False, date_from=None, date_to=None, show=False):
+def classify(conn, recompute=False, date_from=None, date_to=None, show=False,
+             idea_type_names=None, min_score=None, category_bonus=None, trace_fn=None):
+    """Score announcements in `source` (v_idea_source) into announcement_idea_scores.
+
+    idea_type_names : optional iterable of IDEA_TYPES keys to restrict this
+        run to (defaults to every idea type in idea_rules.py). When
+        `recompute` is also set, only THESE idea types' existing scores are
+        cleared for the date range — scores for idea types outside this
+        filter are left untouched.
+    min_score / category_bonus : optional per-run overrides of
+        idea_rules.MIN_SCORE_THRESHOLD / CATEGORY_BONUS_WEIGHT. idea_rules.py
+        itself is never mutated; these only affect this call.
+    trace_fn : optional callable(str) that receives the same per-announcement
+        trace lines `show=True` prints to stdout, e.g. so a UI (Streamlit's
+        Guided Activity) can stream the live scoring process instead of only
+        writing to the process's stdout. If show=True and trace_fn is None,
+        lines are printed as before.
+
+    Returns {"rows_considered", "rows_matched", "scores_written", "per_type"}.
+    """
     cur = conn.cursor()
     ensure_source_view(conn)
     source = SOURCE_VIEW
 
+    def emit(line):
+        if not show:
+            return
+        (trace_fn or print)(line)
+
+    _min_score = MIN_SCORE_THRESHOLD if min_score is None else min_score
+    _cat_bonus = CATEGORY_BONUS_WEIGHT if category_bonus is None else category_bonus
+
+    types_to_run = {
+        name: cfg for name, cfg in IDEA_TYPES.items()
+        if idea_type_names is None or name in idea_type_names
+    }
+
     type_id = {r[0]: r[1] for r in cur.execute("SELECT name, id FROM idea_types")}
-    caps = {name: _cap_for(cfg) for name, cfg in IDEA_TYPES.items()}
+    caps = {name: _cap_for(cfg, category_bonus=_cat_bonus) for name, cfg in types_to_run.items()}
 
     if recompute:
-        if date_from or date_to:
-            sub_sql, sub_params = _apply_date_filter(f"SELECT id FROM {source}", [], date_from, date_to)
-            del_sql = f"DELETE FROM announcement_idea_scores WHERE announcement_id IN ({sub_sql})"
-            cur.execute(del_sql, sub_params)
-        else:
-            cur.execute("DELETE FROM announcement_idea_scores")
+        sub_sql, sub_params = _apply_date_filter(f"SELECT id FROM {source}", [], date_from, date_to)
+        del_sql = f"DELETE FROM announcement_idea_scores WHERE announcement_id IN ({sub_sql})"
+        del_params = list(sub_params)
+        if idea_type_names is not None:
+            wanted_ids = [type_id[n] for n in types_to_run if n in type_id]
+            if not wanted_ids:
+                wanted_ids = [-1]  # nothing matches -> delete nothing, instead of everything
+            placeholders = ",".join("?" * len(wanted_ids))
+            del_sql += f" AND idea_type_id IN ({placeholders})"
+            del_params += wanted_ids
+        cur.execute(del_sql, del_params)
 
-    # company_name/symbol are only needed for the --showideageneration trace,
-    # but selecting them is cheap so we always pull them for a simpler query.
+    # company_name/symbol are only needed for the trace, but selecting them
+    # is cheap so we always pull them for a simpler query.
     base_sql = f"SELECT id, company_name, symbol, subject, category, subcategory FROM {source}"
     sql, params = _apply_date_filter(base_sql, [], date_from, date_to)
     rows = cur.execute(sql, params).fetchall()
 
     already_scored = set()
     if not recompute:
-        already_scored = {r[0] for r in cur.execute("SELECT DISTINCT announcement_id FROM announcement_idea_scores")}
+        exist_sql = "SELECT DISTINCT announcement_id FROM announcement_idea_scores"
+        exist_params = []
+        if idea_type_names is not None:
+            wanted_ids = [type_id[n] for n in types_to_run if n in type_id]
+            if wanted_ids:
+                placeholders = ",".join("?" * len(wanted_ids))
+                exist_sql += f" WHERE idea_type_id IN ({placeholders})"
+                exist_params = wanted_ids
+        already_scored = {r[0] for r in cur.execute(exist_sql, exist_params)}
 
     inserted = 0
+    matched_ann_ids = set()
+    per_type = {}
     for ann_id, company_name, symbol, subject, category, subcategory in rows:
         if ann_id in already_scored:
-            if show:
-                print(f"\n[id {ann_id}] {symbol or '-'} {(subject or '')[:70]!r} -- already scored, skipped "
-                      f"(use --recompute to re-run)")
+            emit(f"\n[id {ann_id}] {symbol or '-'} {(subject or '')[:70]!r} -- already scored, skipped "
+                 f"(use --recompute / Force re-score to re-run)")
             continue
 
         subj = f" {(subject or '').lower()} "
         cat_text = f"{(category or '')} {(subcategory or '')}".lower()
 
-        if show:
-            print(f"\n[id {ann_id}] {symbol or '-'} {company_name or ''}")
-            print(f"  subject: {subject!r}")
-            if category or subcategory:
-                print(f"  category/subcategory: {category!r} / {subcategory!r}")
+        emit(f"\n[id {ann_id}] {symbol or '-'} {company_name or ''}")
+        emit(f"  subject: {subject!r}")
+        if category or subcategory:
+            emit(f"  category/subcategory: {category!r} / {subcategory!r}")
 
         ann_had_match = False
-        for type_name, cfg in IDEA_TYPES.items():
+        for type_name, cfg in types_to_run.items():
             raw = 0.0
             matched = []
             neg_hit = None
@@ -399,13 +445,12 @@ def classify(conn, recompute=False, date_from=None, date_to=None, show=False):
                     neg_hit = phrase
                     break
             if neg_hit:
-                if show:
-                    # only worth mentioning if a positive keyword would otherwise
-                    # have fired -- avoids printing a disqualification line for
-                    # every idea type that was never going to match anyway.
-                    would_match = any(p in subj for p, _ in cfg["keywords"])
-                    if would_match:
-                        print(f"  -> {type_name}: DISQUALIFIED (negative phrase {neg_hit!r} found)")
+                # only worth mentioning if a positive keyword would otherwise
+                # have fired -- avoids a disqualification line for every idea
+                # type that was never going to match anyway.
+                would_match = any(p in subj for p, _ in cfg["keywords"])
+                if would_match:
+                    emit(f"  -> {type_name}: DISQUALIFIED (negative phrase {neg_hit!r} found)")
                 continue
 
             for phrase, weight in cfg["keywords"]:
@@ -415,7 +460,7 @@ def classify(conn, recompute=False, date_from=None, date_to=None, show=False):
 
             for phrase in cfg.get("category_hints", []):
                 if phrase in cat_text:
-                    raw += CATEGORY_BONUS_WEIGHT
+                    raw += _cat_bonus
                     matched.append(f"[category] {phrase}")
                     break  # only count the bonus once
 
@@ -423,10 +468,9 @@ def classify(conn, recompute=False, date_from=None, date_to=None, show=False):
                 continue
 
             score = round(min(100.0, raw / caps[type_name] * 100.0), 1)
-            if score < MIN_SCORE_THRESHOLD:
-                if show:
-                    print(f"  -> {type_name}: below threshold  raw={raw} cap={caps[type_name]} "
-                          f"score={score} (< {MIN_SCORE_THRESHOLD})  matched={matched}")
+            if score < _min_score:
+                emit(f"  -> {type_name}: below threshold  raw={raw} cap={caps[type_name]} "
+                     f"score={score} (< {_min_score})  matched={matched}")
                 continue
 
             cur.execute(
@@ -439,15 +483,23 @@ def classify(conn, recompute=False, date_from=None, date_to=None, show=False):
             )
             inserted += 1
             ann_had_match = True
-            if show:
-                print(f"  -> {type_name}: MATCHED  raw={raw} cap={caps[type_name]} score={score}  "
-                      f"matched={matched}  [RECORDED]")
+            matched_ann_ids.add(ann_id)
+            per_type[type_name] = per_type.get(type_name, 0) + 1
+            emit(f"  -> {type_name}: MATCHED  raw={raw} cap={caps[type_name]} score={score}  "
+                 f"matched={matched}  [RECORDED]")
 
-        if show and not ann_had_match:
-            print("  -> no idea type matched")
+        if not ann_had_match:
+            emit("  -> no idea type matched")
 
     conn.commit()
+    summary = {
+        "rows_considered": len(rows),
+        "rows_matched": len(matched_ann_ids),
+        "scores_written": inserted,
+        "per_type": per_type,
+    }
     print(f"[classify] scored {len(rows)} announcements, {inserted} idea matches recorded.")
+    return summary
 
 
 def export(conn, out_path, date_from=None, date_to=None):

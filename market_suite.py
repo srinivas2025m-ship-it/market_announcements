@@ -1061,7 +1061,7 @@ def render_idea_board(db_path: str, kp: str, source_label: str = ""):
         st.error(
             f"`{idb_db_path}` doesn't have the idea-board tables yet. Run:\n\n"
             f"`python3 announcement_ideas_pipeline.py --db {idb_db_path} run`\n\n"
-            f"(or use **Guided Activity → ③ Score ideas**, with **Source** set to this one)\n\n"
+            f"(or use **Guided Activity → ③ Score ideas**, with this DB included under **Source(s) to score**)\n\n"
             f"Details: {e}"
         )
         return
@@ -2525,22 +2525,26 @@ def ga_run_scrape(sources: list, from_date, to_date, bse_eq_symbols=None,
 
 
 def ga_ensure_idea_tables(db_path: str):
-    """Create idea_groups / idea_types / announcement_idea_scores in the BSE
-    Equity DB (if missing) and (re)seed idea_groups/idea_types from idea_rules.py.
+    """Create/refresh idea_groups / idea_types / announcement_idea_scores +
+    v_idea_source / v_announcement_ideas in `db_path`, seeded from
+    idea_rules.py.
 
-    Uses check-then-insert/update rather than `ON CONFLICT` throughout: a DB
-    that already has these tables from an older/manual run of
-    announcement_ideas_pipeline.py may not have a UNIQUE constraint on `name`
-    (CREATE TABLE IF NOT EXISTS doesn't retrofit constraints onto an existing
-    table), and ON CONFLICT raises OperationalError when there's no matching
-    unique constraint to target. This approach works either way.
+    Delegates straight to announcement_ideas_pipeline.py's own migrate()/
+    seed() when available, so the Guided Activity UI is provably running the
+    exact same schema-setup code as `announcement_ideas_pipeline.py migrate`/
+    `seed` from the command line — no separately-maintained copy to drift out
+    of sync. GA_IDEA_SCORES_DDL below is only a fallback for the (unexpected)
+    case where the pipeline module failed to import.
     """
     conn = sqlite3.connect(db_path)
     try:
+        if _IDEA_PIPELINE_OK:
+            idea_pipeline.migrate(conn)
+            idea_pipeline.seed(conn)
+            return
+        # --- fallback: pipeline module unavailable, do it locally ---
         conn.executescript(GA_IDEA_SCORES_DDL)
         conn.commit()
-
-        # idea_groups
         group_ids = {}
         for i, gname in enumerate(idea_rules.GROUPS):
             row = conn.execute("SELECT id FROM idea_groups WHERE name = ?", (gname,)).fetchone()
@@ -2553,8 +2557,6 @@ def ga_ensure_idea_tables(db_path: str):
                 ).lastrowid
             group_ids[gname] = gid
         conn.commit()
-
-        # idea_types
         for i, (tname, cfg) in enumerate(idea_rules.IDEA_TYPES.items()):
             gid = group_ids.get(cfg["group"])
             row = conn.execute("SELECT id FROM idea_types WHERE name = ?", (tname,)).fetchone()
@@ -2569,10 +2571,6 @@ def ga_ensure_idea_tables(db_path: str):
                     (gid, tname, cfg["description"], i),
                 )
         conn.commit()
-
-        # Best-effort: add a real UNIQUE index going forward, if the data
-        # already in the table allows it (silently skip if it doesn't —
-        # e.g. pre-existing duplicate names from before this fix).
         for stmt in (
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_idea_groups_name ON idea_groups(name)",
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_idea_types_name ON idea_types(name)",
@@ -2587,106 +2585,45 @@ def ga_ensure_idea_tables(db_path: str):
 
 
 def ga_score_announcements(db_path: str, date_start, date_end, idea_type_names=None,
-                            min_score=None, category_bonus=None, force_rescore=False) -> dict:
-    """Score a source DB's `announcements` rows (via the normalized
-    v_idea_source view — works for BSE Equity, BSE SME, NSE Equity or NSE SME)
-    against the idea_rules.py taxonomy and upsert into announcement_idea_scores.
+                            min_score=None, category_bonus=None, force_rescore=False,
+                            trace_fn=None) -> dict:
+    """Score a source DB's rows (via the normalized v_idea_source view — works
+    for BSE Equity, BSE SME, NSE Equity or NSE SME) against the idea_rules.py
+    taxonomy.
 
-    Rule (matches idea_rules.py's documented scoring exactly):
-      raw score = sum(weight) of every keyword phrase found in the subject
-                  (case-insensitive substring) + one category_bonus if the
-                  category/subcategory text matches any of the idea's
-                  category_hints. Any `negative` phrase present zeroes/skips
-                  the idea entirely. Rows scoring >= min_score are recorded.
+    This is now a thin wrapper around announcement_ideas_pipeline.classify() —
+    the exact same function `announcement_ideas_pipeline.py run`/`classify`
+    uses from the command line — instead of a separate re-implementation.
+
+    FIX: the previous copy of this function compared the *raw* sum of matched
+    keyword weights (typically 0.5–8) directly against MIN_SCORE_THRESHOLD
+    (20, a 0–100 *normalized* score in idea_rules.py/announcement_ideas_
+    pipeline.py). That meant almost nothing ever cleared the threshold here,
+    even though the same announcement scored fine via the CLI pipeline —
+    which is why scoring from this page looked broken/empty. classify()
+    applies the same raw → 0-100 cap-based normalization the CLI and the Idea
+    Board both expect, so scores (and the min-score cutoff) are apples-to-
+    apples with everywhere else in the app.
     """
-    min_score = idea_rules.MIN_SCORE_THRESHOLD if min_score is None else min_score
-    category_bonus = idea_rules.CATEGORY_BONUS_WEIGHT if category_bonus is None else category_bonus
-    idea_names = idea_type_names or list(idea_rules.IDEA_TYPES.keys())
-
-    if _IDEA_PIPELINE_OK:
-        _view_conn = sqlite3.connect(db_path)
-        try:
-            idea_pipeline.ensure_source_view(_view_conn)
-        finally:
-            _view_conn.close()
+    if not _IDEA_PIPELINE_OK:
+        raise RuntimeError(f"announcement_ideas_pipeline.py not available: {_IDEA_PIPELINE_ERR}")
 
     conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
     try:
-        type_ids = {r["name"]: r["id"] for r in conn.execute("SELECT id, name FROM idea_types")}
-        rows = conn.execute(
-            f"SELECT id, subject, category, subcategory FROM {IDEA_SOURCE_VIEW} "
-            "WHERE DATE(input_timestamp) BETWEEN ? AND ?",
-            [str(date_start), str(date_end)],
-        ).fetchall()
-
-        n_scores_written, n_rows_matched = 0, 0
-        per_type = Counter()
-
-        for row in rows:
-            ann_id  = row["id"]
-            subject = (row["subject"] or "").lower()
-            cat_txt = f'{row["category"] or ""} {row["subcategory"] or ""}'.lower()
-            row_matched = False
-
-            for idea_name in idea_names:
-                cfg = idea_rules.IDEA_TYPES.get(idea_name)
-                type_id = type_ids.get(idea_name)
-                if cfg is None or type_id is None:
-                    continue
-
-                existing = conn.execute(
-                    "SELECT id FROM announcement_idea_scores WHERE announcement_id=? AND idea_type_id=?",
-                    (ann_id, type_id),
-                ).fetchone()
-                if existing and not force_rescore:
-                    continue  # already scored — skip unless force re-score
-
-                if any(neg in subject for neg in cfg.get("negative", [])):
-                    continue  # disqualified
-
-                score, matched_kws = 0.0, []
-                for phrase, weight in cfg["keywords"]:
-                    if phrase in subject:
-                        score += weight
-                        matched_kws.append(phrase)
-
-                for hint in cfg.get("category_hints", []):
-                    if hint in cat_txt:
-                        score += category_bonus
-                        matched_kws.append(f"[category] {hint}")
-                        break  # bonus applies once per idea, not per matching hint
-
-                if score >= min_score:
-                    if existing:
-                        conn.execute(
-                            "UPDATE announcement_idea_scores "
-                            "SET score=?, matched_keywords=?, scored_at=datetime('now','localtime') WHERE id=?",
-                            (score, json.dumps(matched_kws), existing["id"]),
-                        )
-                    else:
-                        conn.execute(
-                            "INSERT INTO announcement_idea_scores "
-                            "(announcement_id, idea_type_id, score, matched_keywords) VALUES (?, ?, ?, ?)",
-                            (ann_id, type_id, score, json.dumps(matched_kws)),
-                        )
-                    n_scores_written += 1
-                    per_type[idea_name] += 1
-                    row_matched = True
-
-            if row_matched:
-                n_rows_matched += 1
-
-        conn.commit()
+        summary = idea_pipeline.classify(
+            conn,
+            recompute=force_rescore,
+            date_from=str(date_start),
+            date_to=str(date_end),
+            show=trace_fn is not None,
+            trace_fn=trace_fn,
+            idea_type_names=idea_type_names,
+            min_score=min_score,
+            category_bonus=category_bonus,
+        )
     finally:
         conn.close()
-
-    return {
-        "rows_considered": len(rows),
-        "rows_matched":    n_rows_matched,
-        "scores_written":  n_scores_written,
-        "per_type":        dict(per_type),
-    }
+    return summary
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -4199,9 +4136,10 @@ elif page == "Guided Activity":
     # ═══════════════════════ ③ SCORE IDEAS ═══════════════════════
     with ga_tab3:
         st.caption(
-            "Scores the selected source's rows against every idea type in `idea_rules.py` — same keyword / "
-            "category-bonus / negative-phrase rules the file documents — and writes results into that source's "
-            "Idea Board tables."
+            "Scores the selected source(s)' rows against every idea type in `idea_rules.py` — same keyword / "
+            "category-bonus / negative-phrase rules the file documents — and writes results into each source's "
+            "Idea Board tables. Runs through `announcement_ideas_pipeline.classify()` (the same engine "
+            "`announcement_ideas_pipeline.py`'s CLI uses), so results here are guaranteed to match the CLI/report."
         )
 
         if not _IDEA_RULES_OK:
@@ -4210,7 +4148,7 @@ elif page == "Guided Activity":
             st.warning(f"announcement_ideas_pipeline.py not available — scoring is disabled. Details: {_IDEA_PIPELINE_ERR}")
         else:
             st.session_state.setdefault("ga_score_params", {
-                "source":         "bse_equity",
+                "sources":        ["bse_equity"],
                 "use_same_range": True,
                 "score_from": P["from_date"], "score_to": P["to_date"],
                 "groups": list(idea_rules.GROUPS),
@@ -4218,22 +4156,27 @@ elif page == "Guided Activity":
                 "min_score": idea_rules.MIN_SCORE_THRESHOLD,
                 "category_bonus": idea_rules.CATEGORY_BONUS_WEIGHT,
                 "force_rescore": False,
+                "show_live_trace": True,
             })
             SP = st.session_state.ga_score_params
+            SP.setdefault("sources", [SP.pop("source")] if "source" in SP else ["bse_equity"])
+            SP.setdefault("show_live_trace", True)
 
-            st.markdown("**Source to score**")
+            st.markdown("**Source(s) to score**")
+            st.caption("Pick one or more DBs — all selected sources are scored in the same run, over the same window below.")
             src_label_to_key = {v: k for k, v in GA_SOURCE_LABELS.items()}
-            score_src_label = st.selectbox(
-                "Source", list(GA_SOURCE_LABELS.values()),
-                index=list(GA_SOURCE_LABELS.keys()).index(SP["source"]),
-                key="ga_sp_source", label_visibility="collapsed",
+            score_src_labels = st.multiselect(
+                "Sources", list(GA_SOURCE_LABELS.values()),
+                default=[GA_SOURCE_LABELS[s] for s in SP["sources"]],
+                key="ga_sp_sources", label_visibility="collapsed",
             )
-            SP["source"] = src_label_to_key[score_src_label]
+            SP["sources"] = [src_label_to_key[l] for l in score_src_labels] or ["bse_equity"]
 
             st.markdown("**Scoring window**")
             SP["use_same_range"] = st.checkbox(
                 f"Use the same date range as step ① ({P['from_date']:%d-%m-%Y} → {P['to_date']:%d-%m-%Y})",
                 value=SP["use_same_range"], key="ga_sp_same_range",
+                help="Applies to every source selected above — all sources are scored over the same window in one run.",
             )
             if SP["use_same_range"]:
                 SP["score_from"], SP["score_to"] = P["from_date"], P["to_date"]
@@ -4241,6 +4184,8 @@ elif page == "Guided Activity":
                 custom_s = st.date_input("Scoring date range", value=(SP["score_from"], SP["score_to"]), key="ga_sp_custom_range")
                 if isinstance(custom_s, tuple) and len(custom_s) == 2:
                     SP["score_from"], SP["score_to"] = custom_s
+            st.caption(f"Scoring window: **{SP['score_from']:%d-%m-%Y} → {SP['score_to']:%d-%m-%Y}** "
+                       f"(applied to all {len(SP['sources'])} selected source(s))")
 
             st.markdown("**Idea groups & types to score**")
             gcol1, gcol2 = st.columns(2)
@@ -4258,6 +4203,8 @@ elif page == "Guided Activity":
             tcol1, tcol2, tcol3 = st.columns(3)
             SP["min_score"] = tcol1.number_input(
                 "Min score threshold", min_value=0.0, max_value=100.0, value=float(SP["min_score"]), step=0.5, key="ga_sp_min_score",
+                help="A 0–100 normalized score (raw keyword-weight sum ÷ that idea type's cap × 100) — "
+                     "matches the same scale as the Idea Board and `announcement_ideas_pipeline.py report`.",
             )
             SP["category_bonus"] = tcol2.number_input(
                 "Category bonus weight", min_value=0.0, max_value=20.0, value=float(SP["category_bonus"]), step=0.5, key="ga_sp_cat_bonus",
@@ -4265,42 +4212,89 @@ elif page == "Guided Activity":
             SP["force_rescore"] = tcol3.checkbox(
                 "Force re-score (overwrite existing scores)", value=SP["force_rescore"], key="ga_sp_force",
             )
+            SP["show_live_trace"] = st.checkbox(
+                "Show live backend scoring trace while running",
+                value=SP["show_live_trace"], key="ga_sp_show_trace",
+                help="Streams the same per-announcement matching detail `--showideageneration` prints on the "
+                     "command line — every idea type tested, which keywords/negatives/category hints fired, "
+                     "the raw/cap/score math, and the outcome — live, as each source is scored.",
+            )
 
             st.divider()
-            score_label = GA_SOURCE_LABELS[SP["source"]]
-            db_path = DB_PATHS[score_label]
-            if not Path(db_path).exists():
-                st.warning(f"`{db_path}` not found yet — run step ② (with **{score_label}** selected) first.")
+            missing = [GA_SOURCE_LABELS[s] for s in SP["sources"] if not Path(DB_PATHS[GA_SOURCE_LABELS[s]]).exists()]
+            if missing:
+                st.warning(f"Not found yet, will be skipped: {', '.join(missing)} — run step ② for these first.")
+            runnable_sources = [s for s in SP["sources"] if Path(DB_PATHS[GA_SOURCE_LABELS[s]]).exists()]
             run_score = st.button(
                 "▶ Run scoring now", type="primary", key="ga_run_score",
-                disabled=not (Path(db_path).exists() and SP["types"]),
+                disabled=not (runnable_sources and SP["types"]),
             )
             if run_score:
-                with st.spinner(f"Scoring {score_label} announcements against the idea taxonomy …"):
-                    ga_ensure_idea_tables(db_path)
-                    summary = ga_score_announcements(
-                        db_path, SP["score_from"], SP["score_to"],
-                        idea_type_names=SP["types"], min_score=SP["min_score"],
-                        category_bonus=SP["category_bonus"], force_rescore=SP["force_rescore"],
-                    )
-                st.session_state["ga_last_score"] = summary
-                st.session_state["ga_last_score_label"] = score_label
+                all_summaries = {}
+                for src in runnable_sources:
+                    label = GA_SOURCE_LABELS[src]
+                    db_path = DB_PATHS[label]
+                    if SP["show_live_trace"]:
+                        with st.status(f"Scoring {label} — live backend trace", expanded=True) as status:
+                            log_placeholder = st.empty()
+                            log_lines = []
+
+                            def _trace(line, _lines=log_lines, _ph=log_placeholder):
+                                _lines.append(line)
+                                # throttle re-renders a bit on long runs, always show the latest lines
+                                if len(_lines) < 15 or len(_lines) % 4 == 0:
+                                    _ph.code("\n".join(_lines[-400:]), language=None)
+
+                            ga_ensure_idea_tables(db_path)
+                            summary = ga_score_announcements(
+                                db_path, SP["score_from"], SP["score_to"],
+                                idea_type_names=SP["types"], min_score=SP["min_score"],
+                                category_bonus=SP["category_bonus"], force_rescore=SP["force_rescore"],
+                                trace_fn=_trace,
+                            )
+                            log_placeholder.code("\n".join(log_lines[-400:]) or "(no rows in this window)", language=None)
+                            status.update(
+                                label=f"{label}: {summary['scores_written']} idea score(s) written "
+                                      f"from {summary['rows_considered']} row(s) considered",
+                                state="complete",
+                            )
+                    else:
+                        with st.spinner(f"Scoring {label} announcements against the idea taxonomy …"):
+                            ga_ensure_idea_tables(db_path)
+                            summary = ga_score_announcements(
+                                db_path, SP["score_from"], SP["score_to"],
+                                idea_type_names=SP["types"], min_score=SP["min_score"],
+                                category_bonus=SP["category_bonus"], force_rescore=SP["force_rescore"],
+                            )
+                    all_summaries[label] = summary
+                st.session_state["ga_last_score"] = all_summaries
                 st.cache_data.clear()  # so the Idea Board picks up the new scores immediately
 
-            summary = st.session_state.get("ga_last_score")
-            if summary:
-                ran_label = st.session_state.get("ga_last_score_label", score_label)
-                st.markdown(f"**Last run** — {ran_label}")
+            all_summaries = st.session_state.get("ga_last_score")
+            if all_summaries:
+                st.markdown("**Last run**")
+                tot_considered = sum(s["rows_considered"] for s in all_summaries.values())
+                tot_matched = sum(s["rows_matched"] for s in all_summaries.values())
+                tot_written = sum(s["scores_written"] for s in all_summaries.values())
                 m1, m2, m3 = st.columns(3)
-                _metric(m1, f"{summary['rows_considered']:,}", "Rows considered")
-                _metric(m2, f"{summary['rows_matched']:,}",    "Rows matched ≥1 idea")
-                _metric(m3, f"{summary['scores_written']:,}",  "Idea scores written")
-                if summary["per_type"]:
-                    pt_df = pd.DataFrame(
-                        sorted(summary["per_type"].items(), key=lambda x: -x[1]), columns=["Idea type", "Matches"]
-                    )
-                    st.dataframe(pt_df, hide_index=True, use_container_width=True, height=min(400, 40 + 35 * len(pt_df)))
-                st.success(f"Open **Announcements → {ran_label} → 💡 Idea Board** to browse the scored ideas.")
+                _metric(m1, f"{tot_considered:,}", "Rows considered (all sources)")
+                _metric(m2, f"{tot_matched:,}",    "Rows matched ≥1 idea")
+                _metric(m3, f"{tot_written:,}",    "Idea scores written")
+
+                for ran_label, summary in all_summaries.items():
+                    with st.expander(f"{ran_label} — {summary['scores_written']} idea score(s) written", expanded=len(all_summaries) == 1):
+                        c1, c2, c3 = st.columns(3)
+                        _metric(c1, f"{summary['rows_considered']:,}", "Rows considered")
+                        _metric(c2, f"{summary['rows_matched']:,}",    "Rows matched ≥1 idea")
+                        _metric(c3, f"{summary['scores_written']:,}",  "Idea scores written")
+                        if summary["per_type"]:
+                            pt_df = pd.DataFrame(
+                                sorted(summary["per_type"].items(), key=lambda x: -x[1]), columns=["Idea type", "Matches"]
+                            )
+                            st.dataframe(pt_df, hide_index=True, use_container_width=True, height=min(400, 40 + 35 * len(pt_df)))
+                        else:
+                            st.caption("No idea types matched ≥ the min-score threshold in this window.")
+                st.success("Open **Announcements → (source) → 💡 Idea Board** to browse the scored ideas.")
             else:
                 st.info("No scoring run yet this session. Set parameters above then click **Run scoring now**.")
 
