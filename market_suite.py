@@ -541,8 +541,8 @@ with st.sidebar:
     page = option_menu(
         menu_title="Dashboard",
         menu_icon="display",
-        options=["Announcements", "Charts", "Insights", "Calculators", "My Activity", "Guided Activity"],
-        icons=["file-earmark-text", "bar-chart-line", "lightbulb", "calculator", "clock-history", "compass"],
+        options=["Announcements", "Announcement Tracker", "Charts", "Insights", "Calculators", "My Activity", "Guided Activity"],
+        icons=["file-earmark-text", "folder-symlink", "bar-chart-line", "lightbulb", "calculator", "clock-history", "compass"],
         default_index=0,
         styles={
             "container":      {"padding":"0.9rem 0.8rem","background-color":SURFACE,"border-radius":"14px","box-shadow":SHADOW_MD},
@@ -590,7 +590,7 @@ def load_bse_equity(from_dt, to_dt, symbol="", category="", subcategory="") -> p
     if category:    clauses.append("category = ?");    p.append(category)
     if subcategory: clauses.append("subcategory = ?"); p.append(subcategory)
     sql = f"""
-        SELECT scrip_code, symbol, company_name, category, subcategory,
+        SELECT id, scrip_code, symbol, company_name, category, subcategory,
                subject, file_name, input_timestamp
         FROM   v_announcements
         WHERE  {' AND '.join(clauses)}
@@ -609,7 +609,7 @@ def load_bse_sme_ann(from_dt, to_dt, scrip="", category="", grp="") -> pd.DataFr
     if category: clauses.append("LOWER(category) LIKE ?");  p.append(f"%{category.lower()}%")
     if grp:      clauses.append("grp = ?");                 p.append(grp.upper())
     sql = f"""
-        SELECT scrip_code, scrip_name, grp, category, announce_date,
+        SELECT id, scrip_code, scrip_name, grp, category, announce_date,
                end_date, purpose, attachment_url
         FROM   announcements
         WHERE  {' AND '.join(clauses)}
@@ -654,7 +654,7 @@ def load_nse(source: str, from_dt, to_dt, symbol="", subject="") -> pd.DataFrame
     if symbol:  clauses.append("(LOWER(symbol) LIKE ? OR LOWER(company_name) LIKE ?)"); p += [f"%{symbol.lower()}%",f"%{symbol.lower()}%"]
     if subject: clauses.append("LOWER(subject) LIKE ?"); p.append(f"%{subject.lower()}%")
     sql = f"""
-        SELECT symbol, company_name, subject, description, ann_date, attachment_url
+        SELECT id, symbol, company_name, subject, description, ann_date, attachment_url
         FROM   announcements
         WHERE  {' AND '.join(clauses)}
         ORDER  BY ann_date DESC
@@ -1818,6 +1818,632 @@ def render_tracker(db_path: str, kp: str):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  ANNOUNCEMENT TRACKER  —  Master / Tracker (1:N) + Shadow audit table
+#
+#  A single cross-source store (announcement_tracker.db) that lets any
+#  announcement from any of the four feeds (BSE Equity / BSE SME / NSE Equity
+#  / NSE SME) be "tracked" with one click from the Announcements tab.
+#
+#    announcement_master           — one row per company (name/codes/notes)
+#    announcement_tracker          — N rows per master; one per tracked
+#                                     announcement, holding category, link,
+#                                     the raw announcement JSON, and all the
+#                                     "idea-level" analyst flags/notes
+#    announcement_tracker_shadow   — append-only audit log of every INSERT /
+#                                     UPDATE / DELETE against the tracker
+#                                     table (before/after snapshots), i.e.
+#                                     the "shadow table for data modulation
+#                                     operations"
+#
+#  DDL note: uses isolation_level=None (autocommit) with one statement per
+#  conn.execute() call rather than executescript() — matches the working
+#  fix for the SQLite "cannot commit / DDL" errors hit on Windows.
+#  All keys/functions are prefixed at_ / atp_ to avoid clashing with the
+#  rest of the dashboard.
+# ═════════════════════════════════════════════════════════════════════════════
+
+AT_DB_PATH = "announcement_tracker.db"
+
+AT_SPECIAL_SITUATION_TYPES = ["Merger", "Demerger", "OSF", "Buyback", "Other"]
+AT_CAPEX_ORDER_TYPES       = ["Capex", "New Order", "Other"]
+AT_JV_TECH_TYPES           = ["Joint Venture", "New Tech / Technology Transfer", "Other"]
+AT_REG_SENTIMENTS          = ["Neutral", "Positive", "Negative"]
+
+# Per-source field mapping, used both to build the JSON snapshot when an
+# announcement is tracked and to know which raw table a "Delete" action
+# should remove the source row from.
+AT_SOURCE_FIELD_MAP = {
+    "BSE Equity": dict(table="announcements", company="company_name", code="scrip_code",
+                        bse="scrip_code", nse=None, category="category", subcategory="subcategory",
+                        subject="subject", link="document_url", date="input_timestamp"),
+    "BSE SME":    dict(table="announcements", company="scrip_name", code="scrip_code",
+                        bse="scrip_code", nse=None, category="category", subcategory=None,
+                        subject="purpose", link="attachment_url", date="announce_date"),
+    "NSE Equity": dict(table="announcements", company="company_name", code="symbol",
+                        bse=None, nse="symbol", category=None, subcategory=None,
+                        subject="subject", link="attachment_url", date="ann_date"),
+    "NSE SME":    dict(table="announcements", company="company_name", code="symbol",
+                        bse=None, nse="symbol", category=None, subcategory=None,
+                        subject="subject", link="attachment_url", date="ann_date"),
+}
+
+AT_MASTER_DDL = [
+    """CREATE TABLE IF NOT EXISTS announcement_master (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        company_name TEXT NOT NULL,
+        company_code TEXT,
+        bse_code TEXT,
+        nse_code TEXT,
+        long_text TEXT,
+        created_at TEXT DEFAULT (datetime('now','localtime')),
+        updated_at TEXT DEFAULT (datetime('now','localtime'))
+    );""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_at_master_company ON announcement_master(company_name COLLATE NOCASE);",
+    """CREATE TABLE IF NOT EXISTS announcement_tracker (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        master_id INTEGER NOT NULL REFERENCES announcement_master(id),
+        source TEXT NOT NULL,
+        source_announcement_id INTEGER,
+        company_name TEXT,
+        company_code TEXT,
+        category TEXT,
+        subcategory TEXT,
+        link TEXT,
+        json_data TEXT,
+        is_special_situation TEXT DEFAULT 'No',
+        special_situation_type TEXT,
+        is_capex_or_order TEXT DEFAULT 'No',
+        capex_order_type TEXT,
+        is_jv_or_tech TEXT DEFAULT 'No',
+        jv_tech_type TEXT,
+        industry TEXT,
+        sub_industry TEXT,
+        long_note TEXT,
+        regulatory_sentiment TEXT DEFAULT 'Neutral',
+        regulatory_notes TEXT,
+        risk_notes TEXT,
+        created_at TEXT DEFAULT (datetime('now','localtime')),
+        updated_at TEXT DEFAULT (datetime('now','localtime'))
+    );""",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_at_tracker_source_ann ON announcement_tracker(source, source_announcement_id);",
+    "CREATE INDEX IF NOT EXISTS idx_at_tracker_master ON announcement_tracker(master_id);",
+    """CREATE TABLE IF NOT EXISTS announcement_tracker_shadow (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        tracker_id INTEGER,
+        master_id INTEGER,
+        operation TEXT NOT NULL,
+        before_json TEXT,
+        after_json TEXT,
+        changed_by TEXT,
+        changed_at TEXT DEFAULT (datetime('now','localtime'))
+    );""",
+    "CREATE INDEX IF NOT EXISTS idx_at_shadow_tracker ON announcement_tracker_shadow(tracker_id);",
+]
+
+
+def at_init_db():
+    conn = sqlite3.connect(AT_DB_PATH, isolation_level=None)  # autocommit
+    try:
+        for stmt in AT_MASTER_DDL:
+            conn.execute(stmt)
+    finally:
+        conn.close()
+
+
+def at_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(AT_DB_PATH, isolation_level=None, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _at_actor() -> str:
+    try:
+        return current_user or "unknown"
+    except NameError:
+        return "unknown"
+
+
+def _at_shadow_log(conn, operation: str, tracker_id, master_id, before: dict = None, after: dict = None):
+    conn.execute(
+        "INSERT INTO announcement_tracker_shadow (tracker_id, master_id, operation, before_json, after_json, changed_by) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (tracker_id, master_id, operation,
+         json.dumps(before, default=str) if before else None,
+         json.dumps(after, default=str) if after else None,
+         _at_actor()),
+    )
+
+
+def at_get_or_create_master(company_name: str, company_code: str = "", bse_code: str = "", nse_code: str = "") -> int:
+    company_name = (company_name or "Unknown Company").strip()
+    conn = at_conn()
+    try:
+        row = conn.execute(
+            "SELECT id FROM announcement_master WHERE company_name = ? COLLATE NOCASE", (company_name,)
+        ).fetchone()
+        if row:
+            master_id = row["id"]
+            # Backfill codes if this master was created without them.
+            conn.execute(
+                "UPDATE announcement_master SET "
+                "company_code = COALESCE(NULLIF(company_code,''), ?), "
+                "bse_code = COALESCE(NULLIF(bse_code,''), ?), "
+                "nse_code = COALESCE(NULLIF(nse_code,''), ?), "
+                "updated_at = datetime('now','localtime') WHERE id = ?",
+                (company_code or "", bse_code or "", nse_code or "", master_id),
+            )
+            return master_id
+        cur = conn.execute(
+            "INSERT INTO announcement_master (company_name, company_code, bse_code, nse_code) VALUES (?, ?, ?, ?)",
+            (company_name, company_code or "", bse_code or "", nse_code or ""),
+        )
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def at_is_tracked(source: str, source_announcement_id) -> bool:
+    if source_announcement_id is None:
+        return False
+    conn = at_conn()
+    try:
+        row = conn.execute(
+            "SELECT id FROM announcement_tracker WHERE source = ? AND source_announcement_id = ?",
+            (source, int(source_announcement_id)),
+        ).fetchone()
+        return row is not None
+    finally:
+        conn.close()
+
+
+def at_track_announcement(source: str, row: dict) -> int:
+    """One-click 'Track' — finds/creates the company master, then inserts a
+    tracker row (1:N) for this specific announcement. `row` is the raw
+    result-row dict from the source's Announcements listing. Returns the new
+    tracker id, or None if this announcement is already tracked."""
+    cfg = AT_SOURCE_FIELD_MAP[source]
+    company_name = row.get(cfg["company"]) or "Unknown Company"
+    code         = row.get(cfg["code"]) or ""
+    bse_code     = row.get(cfg["bse"]) if cfg["bse"] else ""
+    nse_code     = row.get(cfg["nse"]) if cfg["nse"] else ""
+    category     = row.get(cfg["category"]) if cfg["category"] else ""
+    subcategory  = row.get(cfg["subcategory"]) if cfg["subcategory"] else ""
+    link         = row.get(cfg["link"]) if cfg["link"] else ""
+    source_id    = row.get("id")
+
+    if at_is_tracked(source, source_id):
+        return None
+
+    master_id = at_get_or_create_master(company_name, code, bse_code, nse_code)
+
+    conn = at_conn()
+    try:
+        cur = conn.execute(
+            """INSERT INTO announcement_tracker
+               (master_id, source, source_announcement_id, company_name, company_code,
+                category, subcategory, link, json_data)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (master_id, source, source_id, company_name, code, category, subcategory,
+             link, json.dumps(row, default=str)),
+        )
+        tracker_id = cur.lastrowid
+        _at_shadow_log(conn, "INSERT", tracker_id, master_id, after=dict(row))
+        return tracker_id
+    finally:
+        conn.close()
+
+
+def at_delete_source_announcement(source: str, source_id: int):
+    """Deletes the raw announcement row from its own source DB, and drops
+    any tracker entry pointing at it (with a shadow log entry first)."""
+    cfg = AT_SOURCE_FIELD_MAP[source]
+    src_db = DB_PATHS[source]
+    try:
+        sconn = sqlite3.connect(src_db)
+        try:
+            sconn.execute(f"DELETE FROM {cfg['table']} WHERE id = ?", (int(source_id),))
+            sconn.commit()
+        finally:
+            sconn.close()
+    except Exception:
+        pass  # best-effort — source table shape can vary run to run
+
+    conn = at_conn()
+    try:
+        trow = conn.execute(
+            "SELECT * FROM announcement_tracker WHERE source = ? AND source_announcement_id = ?",
+            (source, int(source_id)),
+        ).fetchone()
+        if trow:
+            _at_shadow_log(conn, "DELETE", trow["id"], trow["master_id"], before=dict(trow))
+            conn.execute("DELETE FROM announcement_tracker WHERE id = ?", (trow["id"],))
+    finally:
+        conn.close()
+
+
+def at_update_tracker(tracker_id: int, fields: dict):
+    conn = at_conn()
+    try:
+        before = conn.execute("SELECT * FROM announcement_tracker WHERE id = ?", (tracker_id,)).fetchone()
+        if not before:
+            return
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        conn.execute(
+            f"UPDATE announcement_tracker SET {cols}, updated_at = datetime('now','localtime') WHERE id = ?",
+            (*fields.values(), tracker_id),
+        )
+        after = conn.execute("SELECT * FROM announcement_tracker WHERE id = ?", (tracker_id,)).fetchone()
+        _at_shadow_log(conn, "UPDATE", tracker_id, before["master_id"], before=dict(before), after=dict(after))
+    finally:
+        conn.close()
+
+
+def at_delete_tracker(tracker_id: int):
+    conn = at_conn()
+    try:
+        before = conn.execute("SELECT * FROM announcement_tracker WHERE id = ?", (tracker_id,)).fetchone()
+        if not before:
+            return
+        _at_shadow_log(conn, "DELETE", tracker_id, before["master_id"], before=dict(before))
+        conn.execute("DELETE FROM announcement_tracker WHERE id = ?", (tracker_id,))
+    finally:
+        conn.close()
+
+
+def at_update_master(master_id: int, fields: dict):
+    conn = at_conn()
+    try:
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        conn.execute(
+            f"UPDATE announcement_master SET {cols}, updated_at = datetime('now','localtime') WHERE id = ?",
+            (*fields.values(), master_id),
+        )
+    finally:
+        conn.close()
+
+
+def at_delete_master(master_id: int):
+    """Cascading delete: master + every tracker row under it (shadow-logged)."""
+    conn = at_conn()
+    try:
+        for trow in conn.execute("SELECT * FROM announcement_tracker WHERE master_id = ?", (master_id,)).fetchall():
+            _at_shadow_log(conn, "DELETE", trow["id"], master_id, before=dict(trow))
+        conn.execute("DELETE FROM announcement_tracker WHERE master_id = ?", (master_id,))
+        conn.execute("DELETE FROM announcement_master WHERE id = ?", (master_id,))
+    finally:
+        conn.close()
+
+
+def at_query(sql: str, params: tuple = ()) -> pd.DataFrame:
+    conn = at_conn()
+    try:
+        return pd.read_sql_query(sql, conn, params=params)
+    finally:
+        conn.close()
+
+
+# ─── Row-action widget — embedded in every source's Announcements sub-tab ───
+
+def at_render_row_actions(df: pd.DataFrame, source: str, kp: str, max_rows: int = 100):
+    """Renders a compact Track (📌) / Delete (🗑️) action list under a source's
+    results grid. `df` must include the raw `id` column from that source DB."""
+    if df.empty or "id" not in df.columns:
+        return
+    cfg = AT_SOURCE_FIELD_MAP[source]
+
+    with st.expander(f"🎯 Track / Delete individual announcements ({min(len(df), max_rows)} of {len(df)} shown)"):
+        confirm_key = f"{kp}_at_confirm_del_id"
+        for _, row in df.head(max_rows).iterrows():
+            rid = row.get("id")
+            rd = row.to_dict()
+            company = rd.get(cfg["company"]) or "—"
+            subject = (rd.get(cfg["subject"]) or "") if cfg["subject"] else ""
+            subject = (subject[:80] + "…") if len(subject) > 80 else subject
+
+            cols = st.columns([3.2, 3.6, 1.1, 1.1])
+            cols[0].write(f"**{company}**")
+            cols[1].caption(subject or "—")
+
+            already = at_is_tracked(source, rid)
+            if already:
+                cols[2].markdown(":green[📌 Tracked]")
+            else:
+                if cols[2].button("📌 Track", key=f"{kp}_at_track_{rid}", use_container_width=True):
+                    at_track_announcement(source, rd)
+                    st.rerun()
+
+            if st.session_state.get(confirm_key) == rid:
+                dc1, dc2 = cols[3].columns(2)
+                if dc1.button("✅", key=f"{kp}_at_delconf_{rid}", help="Confirm delete"):
+                    at_delete_source_announcement(source, rid)
+                    st.session_state[confirm_key] = None
+                    st.rerun()
+                if dc2.button("✖", key=f"{kp}_at_delcancel_{rid}", help="Cancel"):
+                    st.session_state[confirm_key] = None
+                    st.rerun()
+            else:
+                if cols[3].button("🗑️ Delete", key=f"{kp}_at_del_{rid}", use_container_width=True):
+                    st.session_state[confirm_key] = rid
+                    st.rerun()
+            st.divider()
+
+
+# ─── Announcement Tracker page — Search / Overview / Create (full CRUD) ────
+
+def atp_go_search():
+    st.session_state["atp_view"] = "search"
+    st.session_state["atp_confirm_delete_master"] = None
+
+
+def atp_go_create():
+    st.session_state["atp_view"] = "create"
+
+
+def atp_go_overview(master_id: int):
+    st.session_state["atp_selected_master_id"] = master_id
+    st.session_state["atp_view"] = "overview"
+
+
+def atp_render_search():
+    kw = st.text_input(
+        "Search (company name, company code, BSE code, NSE code)",
+        key="atp_search_kw", placeholder="e.g. Reliance, RELIANCE, 500325...",
+    )
+    if kw:
+        masters = at_query(
+            """SELECT * FROM announcement_master
+               WHERE company_name LIKE ? OR company_code LIKE ? OR bse_code LIKE ? OR nse_code LIKE ?
+               ORDER BY company_name""",
+            tuple([f"%{kw}%"] * 4),
+        )
+    else:
+        masters = at_query("SELECT * FROM announcement_master ORDER BY company_name")
+
+    counts = at_query("SELECT master_id, COUNT(*) AS n FROM announcement_tracker GROUP BY master_id")
+    count_map = dict(zip(counts["master_id"], counts["n"])) if not counts.empty else {}
+
+    st.caption(f"{len(masters)} companies in the Announcement Master")
+    if masters.empty:
+        st.info("No companies tracked yet. Use ➕ New, or hit 📌 Track on an announcement in the Announcements tab.")
+        return
+
+    hcols = st.columns([2.6, 1.2, 1.0, 1.0, 1.0, 1.6])
+    for col, label in zip(hcols, ["Company", "Company code", "BSE code", "NSE code", "Tracked #", "Actions"]):
+        col.markdown(f"**{label}**")
+    st.divider()
+
+    confirm_key = "atp_confirm_delete_master"
+    for _, m in masters.iterrows():
+        mid = int(m["id"])
+        cols = st.columns([2.6, 1.2, 1.0, 1.0, 1.0, 1.6])
+        cols[0].write(m["company_name"])
+        cols[1].write(m["company_code"] or "—")
+        cols[2].write(m["bse_code"] or "—")
+        cols[3].write(m["nse_code"] or "—")
+        cols[4].write(str(count_map.get(mid, 0)))
+
+        if st.session_state.get(confirm_key) == mid:
+            wc1, wc2 = cols[5].columns(2)
+            if wc1.button("✅", key=f"atp_mconf_{mid}"):
+                at_delete_master(mid)
+                st.session_state[confirm_key] = None
+                st.rerun()
+            if wc2.button("✖", key=f"atp_mcancel_{mid}"):
+                st.session_state[confirm_key] = None
+                st.rerun()
+        else:
+            wc1, wc2 = cols[5].columns(2)
+            if wc1.button("👁️ Open", key=f"atp_mopen_{mid}", use_container_width=True):
+                atp_go_overview(mid)
+                st.rerun()
+            if wc2.button("🗑️", key=f"atp_mdel_{mid}", help="Delete company + all tracked entries", use_container_width=True):
+                st.session_state[confirm_key] = mid
+                st.rerun()
+        st.divider()
+
+
+def atp_render_create():
+    st.markdown("**Create a company in the Announcement Master**")
+    with st.form("atp_create_master_form"):
+        c1, c2 = st.columns(2)
+        company_name = c1.text_input("Company name *")
+        company_code = c2.text_input("Company code")
+        c3, c4 = st.columns(2)
+        bse_code = c3.text_input("BSE code")
+        nse_code = c4.text_input("NSE code")
+        long_text = st.text_area("Long text (company notes / description)", height=100)
+        submitted = st.form_submit_button("Create company", type="primary")
+        if submitted:
+            if not company_name.strip():
+                st.error("Company name is required.")
+            else:
+                mid = at_get_or_create_master(company_name, company_code, bse_code, nse_code)
+                if long_text.strip():
+                    at_update_master(mid, {"long_text": long_text.strip()})
+                st.success(f"Created/updated **{company_name}**.")
+                atp_go_overview(mid)
+                st.rerun()
+
+    st.divider()
+    st.markdown("**Manually add a tracked announcement to an existing company**")
+    masters = at_query("SELECT id, company_name FROM announcement_master ORDER BY company_name")
+    if masters.empty:
+        st.caption("Create a company above first.")
+        return
+    with st.form("atp_create_tracker_form"):
+        target = st.selectbox("Company", masters["company_name"].tolist(), key="atp_ct_company")
+        mid = int(masters.loc[masters["company_name"] == target, "id"].iloc[0])
+        c1, c2 = st.columns(2)
+        source = c1.selectbox("Source", list(DB_PATHS.keys()), key="atp_ct_source")
+        category = c2.text_input("Category", key="atp_ct_category")
+        subcategory = st.text_input("Sub-category", key="atp_ct_subcategory")
+        link = st.text_input("Link (attachment / document URL)", key="atp_ct_link")
+        long_note = st.text_area("Long note", height=80, key="atp_ct_note")
+        submitted2 = st.form_submit_button("Add tracker entry", type="primary")
+        if submitted2:
+            conn = at_conn()
+            try:
+                cur = conn.execute(
+                    """INSERT INTO announcement_tracker
+                       (master_id, source, company_name, category, subcategory, link, long_note)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (mid, source, target, category, subcategory, link, long_note),
+                )
+                _at_shadow_log(conn, "INSERT", cur.lastrowid, mid, after={
+                    "source": source, "category": category, "subcategory": subcategory,
+                    "link": link, "long_note": long_note,
+                })
+            finally:
+                conn.close()
+            st.success("Tracker entry added.")
+            atp_go_overview(mid)
+            st.rerun()
+
+
+def atp_render_tracker_row(t: pd.Series):
+    tid = int(t["id"])
+    label = t["category"] or t["source"] or "Tracker entry"
+    with st.expander(f"#{tid} · {label} · {t['source'] or '—'}"):
+        with st.form(f"atp_trk_edit_{tid}"):
+            c1, c2 = st.columns(2)
+            category = c1.text_input("Category", value=t["category"] or "", key=f"atp_cat_{tid}")
+            subcategory = c2.text_input("Sub-category", value=t["subcategory"] or "", key=f"atp_subcat_{tid}")
+            link = st.text_input("Link", value=t["link"] or "", key=f"atp_link_{tid}")
+
+            st.markdown("**Idea level — special situation**")
+            sc1, sc2 = st.columns(2)
+            is_ss = sc1.selectbox("Is a special situation?", ["No", "Yes"],
+                                   index=(1 if t["is_special_situation"] == "Yes" else 0), key=f"atp_isss_{tid}")
+            ss_type = sc2.selectbox("Type", AT_SPECIAL_SITUATION_TYPES,
+                                     index=(AT_SPECIAL_SITUATION_TYPES.index(t["special_situation_type"])
+                                            if t["special_situation_type"] in AT_SPECIAL_SITUATION_TYPES else 0),
+                                     key=f"atp_sstype_{tid}")
+
+            st.markdown("**Idea level — capex / new order**")
+            cc1, cc2 = st.columns(2)
+            is_capex = cc1.selectbox("Is Capex or New Order?", ["No", "Yes"],
+                                      index=(1 if t["is_capex_or_order"] == "Yes" else 0), key=f"atp_iscap_{tid}")
+            capex_type = cc2.selectbox("Type", AT_CAPEX_ORDER_TYPES,
+                                        index=(AT_CAPEX_ORDER_TYPES.index(t["capex_order_type"])
+                                               if t["capex_order_type"] in AT_CAPEX_ORDER_TYPES else 0),
+                                        key=f"atp_captype_{tid}")
+
+            st.markdown("**Idea level — JV / new tech**")
+            jc1, jc2 = st.columns(2)
+            is_jv = jc1.selectbox("Is JV or New Tech Transfer?", ["No", "Yes"],
+                                   index=(1 if t["is_jv_or_tech"] == "Yes" else 0), key=f"atp_isjv_{tid}")
+            jv_type = jc2.selectbox("Type", AT_JV_TECH_TYPES,
+                                     index=(AT_JV_TECH_TYPES.index(t["jv_tech_type"])
+                                            if t["jv_tech_type"] in AT_JV_TECH_TYPES else 0),
+                                     key=f"atp_jvtype_{tid}")
+
+            ic1, ic2 = st.columns(2)
+            industry = ic1.text_input("Industry", value=t["industry"] or "", key=f"atp_ind_{tid}")
+            sub_industry = ic2.text_input("Sub-industry", value=t["sub_industry"] or "", key=f"atp_subind_{tid}")
+
+            long_note = st.text_area("Long note", value=t["long_note"] or "", height=90, key=f"atp_note_{tid}")
+
+            rc1, rc2 = st.columns([1, 3])
+            reg_sent = rc1.selectbox("Regulatory policy", AT_REG_SENTIMENTS,
+                                      index=(AT_REG_SENTIMENTS.index(t["regulatory_sentiment"])
+                                             if t["regulatory_sentiment"] in AT_REG_SENTIMENTS else 0),
+                                      key=f"atp_regsent_{tid}")
+            reg_notes = rc2.text_input("Regulatory notes", value=t["regulatory_notes"] or "", key=f"atp_regnotes_{tid}")
+
+            risk_notes = st.text_area("Risk assessment notes", value=t["risk_notes"] or "", height=80, key=f"atp_risk_{tid}")
+
+            if t["json_data"]:
+                with st.container(border=True):
+                    st.caption("Raw announcement JSON")
+                    st.json(t["json_data"], expanded=False)
+
+            save_col, del_col = st.columns([1, 1])
+            saved = save_col.form_submit_button("💾 Save", type="primary", use_container_width=True)
+            deleted = del_col.form_submit_button("🗑️ Delete entry", use_container_width=True)
+
+            if saved:
+                at_update_tracker(tid, {
+                    "category": category, "subcategory": subcategory, "link": link,
+                    "is_special_situation": is_ss, "special_situation_type": ss_type,
+                    "is_capex_or_order": is_capex, "capex_order_type": capex_type,
+                    "is_jv_or_tech": is_jv, "jv_tech_type": jv_type,
+                    "industry": industry, "sub_industry": sub_industry,
+                    "long_note": long_note, "regulatory_sentiment": reg_sent,
+                    "regulatory_notes": reg_notes, "risk_notes": risk_notes,
+                })
+                st.success("Saved.")
+                st.rerun()
+            if deleted:
+                at_delete_tracker(tid)
+                st.success("Tracker entry deleted.")
+                st.rerun()
+
+
+def atp_render_overview():
+    mid = st.session_state["atp_selected_master_id"]
+    st.button("← Back to search", on_click=atp_go_search, key="atp_back_btn")
+
+    m_df = at_query("SELECT * FROM announcement_master WHERE id = ?", (mid,))
+    if m_df.empty:
+        st.error("Company not found.")
+        return
+    m = m_df.iloc[0]
+
+    st.subheader(m["company_name"])
+    with st.form("atp_master_edit_form"):
+        c1, c2, c3 = st.columns(3)
+        company_code = c1.text_input("Company code", value=m["company_code"] or "")
+        bse_code = c2.text_input("BSE code", value=m["bse_code"] or "")
+        nse_code = c3.text_input("NSE code", value=m["nse_code"] or "")
+        long_text = st.text_area("Long text", value=m["long_text"] or "", height=90)
+        if st.form_submit_button("💾 Save company info"):
+            at_update_master(mid, {
+                "company_code": company_code, "bse_code": bse_code,
+                "nse_code": nse_code, "long_text": long_text,
+            })
+            st.success("Saved.")
+            st.rerun()
+
+    st.divider()
+    trackers = at_query("SELECT * FROM announcement_tracker WHERE master_id = ? ORDER BY created_at DESC", (mid,))
+    st.markdown(f"**Tracked announcements ({len(trackers)})**")
+    if trackers.empty:
+        st.info("Nothing tracked for this company yet.")
+    else:
+        for _, t in trackers.iterrows():
+            atp_render_tracker_row(t)
+
+
+def render_announcement_tracker_page():
+    st.markdown("""<div class="page-head">
+      <h1>🗂️ Announcement Tracker</h1>
+      <p>Company master ↔ tracked announcements (1:N) — idea flags, industry, regulatory & risk notes</p>
+    </div>""", unsafe_allow_html=True)
+
+    at_init_db()
+    st.session_state.setdefault("atp_view", "search")
+    st.session_state.setdefault("atp_selected_master_id", None)
+    st.session_state.setdefault("atp_confirm_delete_master", None)
+
+    if st.session_state["atp_view"] != "overview":
+        nav1, nav2, _ = st.columns([1, 1, 4])
+        nav1.button("🔍 Search", use_container_width=True, key="atp_nav_search",
+                    type="primary" if st.session_state["atp_view"] == "search" else "secondary",
+                    on_click=atp_go_search)
+        nav2.button("➕ New", use_container_width=True, key="atp_nav_create",
+                    type="primary" if st.session_state["atp_view"] == "create" else "secondary",
+                    on_click=atp_go_create)
+        st.divider()
+
+    if st.session_state["atp_view"] == "overview" and st.session_state["atp_selected_master_id"] is not None:
+        atp_render_overview()
+    elif st.session_state["atp_view"] == "create":
+        atp_render_create()
+    else:
+        atp_render_search()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  GUIDED ACTIVITY — HELPERS
 #
 #  Wires the two standalone scripts together, in-process:
@@ -2114,7 +2740,7 @@ if page == "Announcements":
                     "scrip_code":"Code","symbol":"Symbol","company_name":"Company",
                     "category":"Category","subcategory":"Sub-Category",
                     "subject":"Subject","input_timestamp":"Timestamp","document_url":"Document",
-                }).drop(columns=["file_name"], errors="ignore")
+                }).drop(columns=["file_name", "id"], errors="ignore")
 
                 be_settings = _report_settings(
                     "be_table_cfg", list(disp.columns), default_height=500,
@@ -2132,6 +2758,7 @@ if page == "Announcements":
                     _log_view("BSE Equity", be_view.iloc[idx].to_dict())
 
                 st.download_button("⬇ Download CSV", df_be.to_csv(index=False).encode(), "bse_equity_results.csv", "text/csv")
+                at_render_row_actions(df_be, "BSE Equity", "be")
                 _log_search("BSE Equity", {"keyword": keyword, "category": be_cat, "subcategory": be_subcat, "from": str(from_date), "to": str(to_date)}, len(df_be))
 
         with be_sub_idb:
@@ -2155,7 +2782,7 @@ if page == "Announcements":
                     st.caption(f"{len(df_bs):,} record(s)")
                     st.info("No SME announcements found.")
                 else:
-                    disp_bs = df_bs.rename(columns={"scrip_code":"Code","scrip_name":"Company","grp":"Group","category":"Category","announce_date":"Date","end_date":"End","purpose":"Purpose","attachment_url":"Document"})
+                    disp_bs = df_bs.rename(columns={"scrip_code":"Code","scrip_name":"Company","grp":"Group","category":"Category","announce_date":"Date","end_date":"End","purpose":"Purpose","attachment_url":"Document"}).drop(columns=["id"], errors="ignore")
                     bs_settings = _report_settings(
                         "bs_ann_table_cfg", list(disp_bs.columns), default_height=500,
                         label=f"{len(df_bs):,} record(s)",
@@ -2171,6 +2798,7 @@ if page == "Announcements":
                     for idx in (ev2.selection.rows if ev2 else []):
                         _log_view("BSE SME", bs_view.iloc[idx].to_dict())
                     st.download_button("⬇ Download CSV", df_bs.to_csv(index=False).encode(), "bse_sme_ann.csv", "text/csv")
+                    at_render_row_actions(df_bs, "BSE SME", "bs")
             else:
                 df_bc = load_bse_sme_corp(from_date, to_date, keyword)
                 if df_bc.empty:
@@ -2211,7 +2839,7 @@ if page == "Announcements":
                 st.caption(f"{len(df_ne):,} record(s)")
                 st.info("No records found.")
             else:
-                disp_ne = df_ne.rename(columns={"symbol":"Symbol","company_name":"Company","subject":"Subject","description":"Description","ann_date":"Date","attachment_url":"Document"})
+                disp_ne = df_ne.rename(columns={"symbol":"Symbol","company_name":"Company","subject":"Subject","description":"Description","ann_date":"Date","attachment_url":"Document"}).drop(columns=["id"], errors="ignore")
                 ne_settings = _report_settings(
                     "ne_table_cfg", list(disp_ne.columns), default_height=500,
                     label=f"{len(df_ne):,} record(s)",
@@ -2227,6 +2855,7 @@ if page == "Announcements":
                 for idx in (ev3.selection.rows if ev3 else []):
                     _log_view("NSE Equity", ne_view.iloc[idx].to_dict())
                 st.download_button("⬇ Download CSV", df_ne.to_csv(index=False).encode(), "nse_equity_results.csv", "text/csv")
+                at_render_row_actions(df_ne, "NSE Equity", "ne")
             _log_search("NSE Equity", {"keyword": keyword, "subject": ne_sub, "from": str(from_date), "to": str(to_date)}, len(df_ne))
 
         with ne_sub_idb:
@@ -2248,7 +2877,7 @@ if page == "Announcements":
                 st.caption(f"{len(df_ns):,} record(s)")
                 st.info("No records found.")
             else:
-                disp_ns = df_ns.rename(columns={"symbol":"Symbol","company_name":"Company","subject":"Subject","description":"Description","ann_date":"Date","attachment_url":"Document"})
+                disp_ns = df_ns.rename(columns={"symbol":"Symbol","company_name":"Company","subject":"Subject","description":"Description","ann_date":"Date","attachment_url":"Document"}).drop(columns=["id"], errors="ignore")
                 ns_settings = _report_settings(
                     "ns_table_cfg", list(disp_ns.columns), default_height=500,
                     label=f"{len(df_ns):,} record(s)",
@@ -2264,6 +2893,7 @@ if page == "Announcements":
                 for idx in (ev4.selection.rows if ev4 else []):
                     _log_view("NSE SME", ns_view.iloc[idx].to_dict())
                 st.download_button("⬇ Download CSV", df_ns.to_csv(index=False).encode(), "nse_sme_results.csv", "text/csv")
+                at_render_row_actions(df_ns, "NSE SME", "ns")
             _log_search("NSE SME", {"keyword": keyword, "subject": ns_sub, "from": str(from_date), "to": str(to_date)}, len(df_ns))
 
         with ns_sub_idb:
@@ -2272,6 +2902,15 @@ if page == "Announcements":
         with ns_sub_trk:
             render_tracker(DB_PATHS["NSE SME"], "ns")
 
+    st.stop()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PAGE: ANNOUNCEMENT TRACKER
+# ═════════════════════════════════════════════════════════════════════════════
+
+elif page == "Announcement Tracker":
+    render_announcement_tracker_page()
     st.stop()
 
 
