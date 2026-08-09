@@ -541,8 +541,8 @@ with st.sidebar:
     page = option_menu(
         menu_title="Dashboard",
         menu_icon="display",
-        options=["Announcements", "Announcement Tracker", "Charts", "Insights", "Calculators", "My Activity", "Guided Activity"],
-        icons=["file-earmark-text", "folder-symlink", "bar-chart-line", "lightbulb", "calculator", "clock-history", "compass"],
+        options=["Announcements", "Announcement Tracker", "Charts", "Insights", "Calculators", "My Activity", "Guided Activity", "Guided DB Clean-up"],
+        icons=["file-earmark-text", "folder-symlink", "bar-chart-line", "lightbulb", "calculator", "clock-history", "compass", "trash3"],
         default_index=0,
         styles={
             "container":      {"padding":"0.9rem 0.8rem","background-color":SURFACE,"border-radius":"14px","box-shadow":SHADOW_MD},
@@ -2690,6 +2690,302 @@ def ga_score_announcements(db_path: str, date_start, date_end, idea_type_names=N
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+#  GUIDED DB CLEAN-UP — HELPERS
+#
+#  A guided, date-range-scoped housekeeping tool for every DB the app owns:
+#    • BSE Equity / BSE SME / NSE Equity / NSE SME  (raw announcements +
+#      corp actions, plus the Idea Board & Tracker tables that live inside
+#      each of those same DB files)
+#    • Announcement Tracker  (announcement_tracker.db — the cross-source
+#      master/tracker; its rows are only removed if the raw row they point
+#      to is being removed in the same run, and only when explicitly opted
+#      into via the "also clear linked Tracker entries" checkbox)
+#
+#  Flow is dry-run-first: step ② always counts before step ③ can delete
+#  anything, and step ③ is gated behind a typed "DELETE" confirmation that
+#  is invalidated the moment the scope or date range changes, so a stale
+#  preview can never be used to authorize a different delete.
+#  All keys/functions are prefixed dbc_ to avoid clashing with the rest of
+#  the dashboard.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Which table(s) hold dated rows for each source, which column holds the
+# date, and which child tables (same DB file, FK'd on announcement_id) must
+# be purged first when their parent "announcements" rows disappear.
+DBC_SOURCE_TABLES = {
+    "BSE Equity": [
+        {"table": "announcements", "date_col": "input_timestamp", "label": "Announcements",
+         "children": ["announcement_idea_scores", "announcement_notes", "announcement_status", "watchlist"]},
+    ],
+    "BSE SME": [
+        {"table": "announcements", "date_col": "announce_date", "label": "Announcements",
+         "children": ["announcement_idea_scores", "announcement_notes", "announcement_status", "watchlist"]},
+        {"table": "corp_actions", "date_col": "ex_date", "label": "Corp Actions", "children": []},
+    ],
+    "NSE Equity": [
+        {"table": "announcements", "date_col": "ann_date", "label": "Announcements",
+         "children": ["announcement_idea_scores", "announcement_notes", "announcement_status", "watchlist"]},
+    ],
+    "NSE SME": [
+        {"table": "announcements", "date_col": "ann_date", "label": "Announcements",
+         "children": ["announcement_idea_scores", "announcement_notes", "announcement_status", "watchlist"]},
+    ],
+}
+
+DBC_CLEANUP_LOG_DDL = """
+CREATE TABLE IF NOT EXISTS cleanup_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_at       TEXT DEFAULT (datetime('now','localtime')),
+    actor        TEXT,
+    date_start   TEXT,
+    date_end     TEXT,
+    scope_json   TEXT,
+    result_json  TEXT,
+    vacuumed     TEXT
+);
+"""
+
+
+def dbc_init_log():
+    conn = sqlite3.connect(AUTH_DB)
+    try:
+        conn.executescript(DBC_CLEANUP_LOG_DDL)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _dbc_table_exists(conn, table: str) -> bool:
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
+    return row is not None
+
+
+def _dbc_quote_path(path: str) -> str:
+    return str(path).replace("'", "''")
+
+
+def dbc_count_matches(db_path: str, table: str, date_col: str, date_start, date_end) -> int:
+    """Dry-run row count for one table within [date_start, date_end] inclusive."""
+    if not db_path or not Path(db_path).exists():
+        return 0
+    conn = sqlite3.connect(db_path)
+    try:
+        if not _dbc_table_exists(conn, table):
+            return 0
+        row = conn.execute(
+            f"SELECT COUNT(*) FROM {table} WHERE DATE({date_col}) BETWEEN ? AND ?",
+            (str(date_start), str(date_end)),
+        ).fetchone()
+        return int(row[0]) if row else 0
+    except sqlite3.OperationalError:
+        return 0
+    finally:
+        conn.close()
+
+
+def dbc_count_children(db_path: str, ann_table: str, date_col: str, date_start, date_end, children: list) -> dict:
+    """For each child table FK'd on announcement_id, count rows that would be
+    cascaded away if the matching parent rows were deleted."""
+    out = {c: 0 for c in children}
+    if not db_path or not Path(db_path).exists():
+        return out
+    conn = sqlite3.connect(db_path)
+    try:
+        if not _dbc_table_exists(conn, ann_table):
+            return out
+        for child in children:
+            if not _dbc_table_exists(conn, child):
+                continue
+            try:
+                row = conn.execute(
+                    f"SELECT COUNT(*) FROM {child} WHERE announcement_id IN "
+                    f"(SELECT id FROM {ann_table} WHERE DATE({date_col}) BETWEEN ? AND ?)",
+                    (str(date_start), str(date_end)),
+                ).fetchone()
+                out[child] = int(row[0]) if row else 0
+            except sqlite3.OperationalError:
+                out[child] = 0
+    finally:
+        conn.close()
+    return out
+
+
+def dbc_count_tracker_links(scope_sources: list, date_start, date_end) -> int:
+    """Count rows in announcement_tracker.db's cross-source tracker whose
+    `source` is in-scope and whose linked source_announcement_id falls
+    inside the date range of that source's own announcements table."""
+    if not Path(AT_DB_PATH).exists():
+        return 0
+    total = 0
+    conn = sqlite3.connect(AT_DB_PATH)
+    try:
+        if not _dbc_table_exists(conn, "announcement_tracker"):
+            return 0
+        for label in scope_sources:
+            src_db = DB_PATHS.get(label)
+            fmap = AT_SOURCE_FIELD_MAP.get(label)
+            if not src_db or not fmap or not Path(src_db).exists():
+                continue
+            try:
+                conn.execute(f"ATTACH DATABASE '{_dbc_quote_path(src_db)}' AS dbc_src")
+                row = conn.execute(
+                    f"SELECT COUNT(*) FROM announcement_tracker t WHERE t.source = ? "
+                    f"AND t.source_announcement_id IN "
+                    f"(SELECT id FROM dbc_src.{fmap['table']} WHERE DATE({fmap['date']}) BETWEEN ? AND ?)",
+                    (label, str(date_start), str(date_end)),
+                ).fetchone()
+                total += int(row[0]) if row else 0
+            except sqlite3.OperationalError:
+                pass
+            finally:
+                try:
+                    conn.execute("DETACH DATABASE dbc_src")
+                except sqlite3.OperationalError:
+                    pass
+    finally:
+        conn.close()
+    return total
+
+
+def dbc_build_preview(scope: dict, date_start, date_end, cascade_tracker: bool) -> pd.DataFrame:
+    """scope: {source_label: [table_name, ...]} of tables the user checked."""
+    rows = []
+    for label, tables in scope.items():
+        db_path = DB_PATHS.get(label)
+        cfg_by_table = {t["table"]: t for t in DBC_SOURCE_TABLES.get(label, [])}
+        for table in tables:
+            cfg = cfg_by_table.get(table)
+            if not cfg:
+                continue
+            n = dbc_count_matches(db_path, table, cfg["date_col"], date_start, date_end)
+            linked = 0
+            if cfg["children"] and n:
+                linked = sum(dbc_count_children(db_path, table, cfg["date_col"], date_start, date_end, cfg["children"]).values())
+            rows.append({"Source": label, "Table": cfg["label"], "Matching rows": n, "Linked idea/tracker rows": linked})
+    df = pd.DataFrame(rows, columns=["Source", "Table", "Matching rows", "Linked idea/tracker rows"])
+    if cascade_tracker:
+        ann_sources = [lbl for lbl, tabs in scope.items() if "announcements" in tabs]
+        tracker_n = dbc_count_tracker_links(ann_sources, date_start, date_end) if ann_sources else 0
+        df = pd.concat([df, pd.DataFrame([{
+            "Source": "Announcement Tracker", "Table": "Linked tracker rows",
+            "Matching rows": tracker_n, "Linked idea/tracker rows": 0,
+        }])], ignore_index=True)
+    return df
+
+
+def dbc_scope_fingerprint(scope: dict, date_start, date_end, cascade_tracker: bool, vacuum: bool) -> str:
+    payload = {
+        "scope": {k: sorted(v) for k, v in sorted(scope.items())},
+        "from": str(date_start), "to": str(date_end),
+        "cascade_tracker": cascade_tracker, "vacuum": vacuum,
+    }
+    return json.dumps(payload, sort_keys=True)
+
+
+def dbc_run_cleanup(scope: dict, date_start, date_end, cascade_tracker: bool, vacuum: bool, actor: str) -> dict:
+    """Deletes matching rows (+ cascaded same-DB children) per source, then
+    optionally the linked cross-source Tracker rows, then VACUUMs whichever
+    DB files were touched. Each DB file's own deletes run inside one
+    transaction; a failure on one DB is reported but doesn't roll back
+    work already committed against another DB."""
+    per_source, errors, vacuumed = [], [], []
+    tracker_deleted = 0
+
+    for label, tables in scope.items():
+        db_path = DB_PATHS.get(label)
+        if not db_path or not Path(db_path).exists():
+            continue
+        cfg_by_table = {t["table"]: t for t in DBC_SOURCE_TABLES.get(label, [])}
+        conn = sqlite3.connect(db_path)
+        try:
+            touched = False
+            for table in tables:
+                cfg = cfg_by_table.get(table)
+                if not cfg or not _dbc_table_exists(conn, table):
+                    continue
+                date_col = cfg["date_col"]
+                ann_ids = [r[0] for r in conn.execute(
+                    f"SELECT id FROM {table} WHERE DATE({date_col}) BETWEEN ? AND ?",
+                    (str(date_start), str(date_end)),
+                ).fetchall()]
+                child_deleted = {}
+                if ann_ids and cfg["children"]:
+                    placeholders = ",".join("?" * len(ann_ids))
+                    for child in cfg["children"]:
+                        if not _dbc_table_exists(conn, child):
+                            continue
+                        cur = conn.execute(f"DELETE FROM {child} WHERE announcement_id IN ({placeholders})", ann_ids)
+                        child_deleted[child] = cur.rowcount
+                cur = conn.execute(
+                    f"DELETE FROM {table} WHERE DATE({date_col}) BETWEEN ? AND ?",
+                    (str(date_start), str(date_end)),
+                )
+                per_source.append({
+                    "source": label, "table": table, "table_label": cfg["label"],
+                    "rows_deleted": cur.rowcount, "children_deleted": child_deleted, "ids": ann_ids,
+                })
+                touched = True
+            conn.commit()
+            if vacuum and touched:
+                conn.execute("VACUUM")
+                vacuumed.append(label)
+        except Exception as e:
+            conn.rollback()
+            errors.append(f"{label}: {e}")
+        finally:
+            conn.close()
+
+    if cascade_tracker and Path(AT_DB_PATH).exists():
+        deleted_ids_by_source = {}
+        for row in per_source:
+            if row["table"] == "announcements":
+                deleted_ids_by_source.setdefault(row["source"], []).extend(row["ids"])
+        if deleted_ids_by_source:
+            conn = sqlite3.connect(AT_DB_PATH)
+            try:
+                touched = False
+                for label, ids in deleted_ids_by_source.items():
+                    if not ids:
+                        continue
+                    placeholders = ",".join("?" * len(ids))
+                    tr_ids = [r[0] for r in conn.execute(
+                        f"SELECT id FROM announcement_tracker WHERE source=? AND source_announcement_id IN ({placeholders})",
+                        [label, *ids],
+                    ).fetchall()]
+                    if tr_ids:
+                        tph = ",".join("?" * len(tr_ids))
+                        conn.execute(f"DELETE FROM announcement_tracker_shadow WHERE tracker_id IN ({tph})", tr_ids)
+                        cur = conn.execute(f"DELETE FROM announcement_tracker WHERE id IN ({tph})", tr_ids)
+                        tracker_deleted += cur.rowcount
+                        touched = True
+                conn.commit()
+                if vacuum and touched:
+                    conn.execute("VACUUM")
+                    vacuumed.append("Announcement Tracker")
+            except Exception as e:
+                conn.rollback()
+                errors.append(f"Announcement Tracker: {e}")
+            finally:
+                conn.close()
+
+    result = {"per_source": per_source, "tracker_deleted": tracker_deleted, "vacuumed": vacuumed, "errors": errors}
+
+    try:  # best-effort audit log — never let logging break a completed cleanup
+        dbc_init_log()
+        conn = sqlite3.connect(AUTH_DB)
+        conn.execute(
+            "INSERT INTO cleanup_log (actor, date_start, date_end, scope_json, result_json, vacuumed) VALUES (?,?,?,?,?,?)",
+            (actor, str(date_start), str(date_end), json.dumps(scope), json.dumps(result, default=str), json.dumps(vacuumed)),
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+    return result
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 #  PAGE: ANNOUNCEMENTS
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -3959,3 +4255,207 @@ elif page == "Guided Activity":
                 st.success(f"Open **Announcements → {ran_label} → 💡 Idea Board** to browse the scored ideas.")
             else:
                 st.info("No scoring run yet this session. Set parameters above then click **Run scoring now**.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  PAGE: GUIDED DB CLEAN-UP
+# ═════════════════════════════════════════════════════════════════════════════
+
+elif page == "Guided DB Clean-up":
+
+    st.markdown("""<div class="page-head">
+      <h1>🧹 Guided DB Clean-up</h1>
+      <p>Purge old rows out of any of the four source databases — plus the Idea Board, Tracker,
+         and Announcement Tracker tables that hang off them — for a chosen date range.
+         Dry-run counts first, delete only after you type the confirmation.</p>
+    </div>""", unsafe_allow_html=True)
+
+    st.session_state.setdefault("dbc_params", {
+        "sources": ["BSE Equity"],
+        "tables": {"BSE Equity": ["announcements"]},
+        "date_mode": "Last 30 days",
+        "from_date": date.today() - timedelta(days=30),
+        "to_date": date.today() - timedelta(days=1),
+        "cascade_tracker": False,
+        "vacuum": True,
+    })
+    DP = st.session_state.dbc_params
+    st.session_state.setdefault("dbc_last_preview", None)
+    st.session_state.setdefault("dbc_last_fingerprint", None)
+    st.session_state.setdefault("dbc_last_result", None)
+
+    dbc_tab1, dbc_tab2, dbc_tab3 = st.tabs(["① Scope & date range", "② Preview", "③ Run clean-up"])
+
+    # ═══════════════════════ ① SCOPE & DATE RANGE ═══════════════════════
+    with dbc_tab1:
+        st.caption("Pick which databases/tables are in scope, then the date range to purge. "
+                   "Nothing is touched here — this only sets up step ②'s dry run.")
+
+        st.markdown("**Databases & tables to clean**")
+        for label in DB_PATHS.keys():
+            tabs_cfg = DBC_SOURCE_TABLES.get(label, [])
+            db_path = DB_PATHS[label]
+            exists = Path(db_path).exists()
+            with st.container(border=True):
+                hcol1, hcol2 = st.columns([3, 1])
+                src_on = hcol1.checkbox(f"**{label}**", value=label in DP["sources"], key=f"dbc_src_{label}")
+                hcol2.caption(f"`{db_path}`" + ("" if exists else "  · not found yet"))
+                if src_on:
+                    if label not in DP["sources"]:
+                        DP["sources"].append(label)
+                    current_tables = DP["tables"].get(label, [t["table"] for t in tabs_cfg])
+                    cols = st.columns(len(tabs_cfg)) if tabs_cfg else [st]
+                    chosen = []
+                    for col, tcfg in zip(cols, tabs_cfg):
+                        checked = col.checkbox(
+                            tcfg["label"], value=tcfg["table"] in current_tables,
+                            key=f"dbc_tbl_{label}_{tcfg['table']}",
+                        )
+                        if checked:
+                            chosen.append(tcfg["table"])
+                        if tcfg["children"]:
+                            col.caption("cascades: " + ", ".join(tcfg["children"]))
+                    DP["tables"][label] = chosen
+                else:
+                    if label in DP["sources"]:
+                        DP["sources"].remove(label)
+                    DP["tables"].pop(label, None)
+
+        st.markdown("**Date range**")
+        dcol1, dcol2 = st.columns([1.4, 2])
+        date_presets = ["Last 30 days", "Last 90 days", "Last 365 days", "Older than 90 days", "Custom range"]
+        with dcol1:
+            DP["date_mode"] = st.radio("Preset", date_presets, index=date_presets.index(DP["date_mode"]), key="dbc_date_mode")
+        today = date.today()
+        if DP["date_mode"] == "Last 30 days":
+            DP["from_date"], DP["to_date"] = today - timedelta(days=30), today - timedelta(days=1)
+        elif DP["date_mode"] == "Last 90 days":
+            DP["from_date"], DP["to_date"] = today - timedelta(days=90), today - timedelta(days=1)
+        elif DP["date_mode"] == "Last 365 days":
+            DP["from_date"], DP["to_date"] = today - timedelta(days=365), today - timedelta(days=1)
+        elif DP["date_mode"] == "Older than 90 days":
+            DP["from_date"], DP["to_date"] = date(2000, 1, 1), today - timedelta(days=90)
+        else:
+            with dcol2:
+                custom = st.date_input("Custom range", value=(DP["from_date"], DP["to_date"]), key="dbc_custom_range")
+                if isinstance(custom, tuple) and len(custom) == 2:
+                    DP["from_date"], DP["to_date"] = custom
+        st.caption(f"Selected window: **{DP['from_date']:%d-%m-%Y} → {DP['to_date']:%d-%m-%Y}** (inclusive)")
+
+        st.markdown("**Cross-source options**")
+        ccol1, ccol2 = st.columns(2)
+        DP["cascade_tracker"] = ccol1.checkbox(
+            "Also remove Announcement Tracker entries linked to deleted rows",
+            value=DP["cascade_tracker"], key="dbc_cascade_tracker",
+            help="Only rows tracked from a source announcement that's being deleted in this same run — "
+                 "manually-created tracker entries with no source link are never touched.",
+        )
+        DP["vacuum"] = ccol2.checkbox(
+            "VACUUM affected databases afterward (reclaim disk space)",
+            value=DP["vacuum"], key="dbc_vacuum",
+        )
+
+        if not DP["sources"]:
+            st.info("Select at least one database above to continue.")
+
+    # ═══════════════════════ ② PREVIEW ═══════════════════════
+    with dbc_tab2:
+        scope = {lbl: DP["tables"].get(lbl, []) for lbl in DP["sources"] if DP["tables"].get(lbl)}
+        if not scope:
+            st.info("Nothing selected yet — pick databases/tables and a date range in step ① first.")
+        else:
+            st.caption(
+                f"**{sum(len(v) for v in scope.values())} table(s)** across **{len(scope)} database(s)** · "
+                f"**{DP['from_date']:%d-%m-%Y} → {DP['to_date']:%d-%m-%Y}**"
+            )
+            run_preview = st.button("🔍 Run preview (dry run — nothing is deleted)", type="primary", key="dbc_run_preview")
+            if run_preview:
+                with st.spinner("Counting matching rows …"):
+                    preview_df = dbc_build_preview(scope, DP["from_date"], DP["to_date"], DP["cascade_tracker"])
+                st.session_state["dbc_last_preview"] = preview_df
+                st.session_state["dbc_last_fingerprint"] = dbc_scope_fingerprint(
+                    scope, DP["from_date"], DP["to_date"], DP["cascade_tracker"], DP["vacuum"]
+                )
+
+            preview_df = st.session_state.get("dbc_last_preview")
+            if preview_df is not None and not preview_df.empty:
+                total_rows = int(preview_df["Matching rows"].sum())
+                total_linked = int(preview_df["Linked idea/tracker rows"].sum())
+                m1, m2, m3 = st.columns(3)
+                _metric(m1, f"{total_rows:,}", "Rows that would be deleted")
+                _metric(m2, f"{total_linked:,}", "Linked idea/tracker rows cascaded")
+                _metric(m3, DP["to_date"].strftime("%d-%m-%Y"), "Window end")
+                st.dataframe(preview_df, hide_index=True, use_container_width=True)
+                current_fp = dbc_scope_fingerprint(scope, DP["from_date"], DP["to_date"], DP["cascade_tracker"], DP["vacuum"])
+                if current_fp != st.session_state.get("dbc_last_fingerprint"):
+                    st.warning("Scope or date range changed since this preview ran — re-run the preview before deleting.")
+                elif total_rows == 0:
+                    st.info("No matching rows in this window — nothing to clean up.")
+                else:
+                    st.success("Preview is current for step ③ — you can proceed to **Run clean-up**.")
+            elif preview_df is not None:
+                st.info("Preview ran but found no matching rows in this window.")
+            else:
+                st.info("Click **Run preview** to see what would be deleted, before anything is touched.")
+
+    # ═══════════════════════ ③ RUN CLEAN-UP ═══════════════════════
+    with dbc_tab3:
+        scope = {lbl: DP["tables"].get(lbl, []) for lbl in DP["sources"] if DP["tables"].get(lbl)}
+        preview_df = st.session_state.get("dbc_last_preview")
+        current_fp = dbc_scope_fingerprint(scope, DP["from_date"], DP["to_date"], DP["cascade_tracker"], DP["vacuum"]) if scope else None
+        preview_ok = (
+            scope and preview_df is not None and not preview_df.empty
+            and current_fp == st.session_state.get("dbc_last_fingerprint")
+            and int(preview_df["Matching rows"].sum()) > 0
+        )
+
+        if not scope:
+            st.info("Set a scope in step ① first.")
+        elif not preview_ok:
+            st.warning("Run a fresh preview in step ② for the current scope/date range before deleting anything.")
+        else:
+            total_rows = int(preview_df["Matching rows"].sum())
+            st.warning(
+                f"This will permanently delete **{total_rows:,} row(s)** (plus linked idea/tracker rows) "
+                f"from **{DP['from_date']:%d-%m-%Y} → {DP['to_date']:%d-%m-%Y}**. This cannot be undone."
+            )
+            st.dataframe(preview_df, hide_index=True, use_container_width=True)
+            confirm_text = st.text_input(
+                'Type DELETE (in capitals) to arm the button below', key="dbc_confirm_text",
+            )
+            armed = confirm_text.strip() == "DELETE"
+            run_delete = st.button(
+                "🗑️ Permanently delete now", type="primary", disabled=not armed, key="dbc_run_delete",
+            )
+            if run_delete and armed:
+                with st.spinner("Deleting matched rows and cascading linked tables …"):
+                    result = dbc_run_cleanup(
+                        scope, DP["from_date"], DP["to_date"],
+                        DP["cascade_tracker"], DP["vacuum"], actor=current_user,
+                    )
+                st.session_state["dbc_last_result"] = result
+                st.session_state["dbc_last_preview"] = None
+                st.session_state["dbc_last_fingerprint"] = None
+                st.cache_data.clear()
+
+            result = st.session_state.get("dbc_last_result")
+            if result:
+                st.markdown("**Last run**")
+                if result["errors"]:
+                    for err in result["errors"]:
+                        st.error(err)
+                res_rows = [
+                    {"Source": r["source"], "Table": r["table_label"], "Rows deleted": r["rows_deleted"],
+                     "Linked rows cascaded": sum(r["children_deleted"].values())}
+                    for r in result["per_source"]
+                ]
+                if res_rows:
+                    st.dataframe(pd.DataFrame(res_rows), hide_index=True, use_container_width=True)
+                if result["tracker_deleted"]:
+                    st.caption(f"Announcement Tracker: {result['tracker_deleted']:,} linked entr{'y' if result['tracker_deleted']==1 else 'ies'} removed.")
+                if result["vacuumed"]:
+                    st.caption("Vacuumed: " + ", ".join(result["vacuumed"]))
+                if not result["errors"]:
+                    st.success("Clean-up complete.")
+            else:
+                st.info("No clean-up run yet this session.")
