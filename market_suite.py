@@ -2915,6 +2915,15 @@ def dbc_scope_fingerprint(scope: dict, date_start, date_end, cascade_tracker: bo
     return json.dumps(payload, sort_keys=True)
 
 
+def _dbc_chunks(seq: list, size: int = 400):
+    """Yield successive `size`-sized slices of seq. SQLite caps bound
+    parameters per statement (often 999), so any IN (...) built from a list
+    of ids that could be large — matched announcement ids, tracker ids —
+    must be sent in batches rather than as one giant placeholder list."""
+    for i in range(0, len(seq), size):
+        yield seq[i:i + size]
+
+
 def dbc_run_cleanup(scope: dict, date_start, date_end, cascade_tracker: bool, vacuum: bool, actor: str) -> dict:
     """Deletes matching rows (+ cascaded same-DB children) per source, then
     optionally the linked cross-source Tracker rows, then VACUUMs whichever
@@ -2943,12 +2952,15 @@ def dbc_run_cleanup(scope: dict, date_start, date_end, cascade_tracker: bool, va
                 ).fetchall()]
                 child_deleted = {}
                 if ann_ids and cfg["children"]:
-                    placeholders = ",".join("?" * len(ann_ids))
                     for child in cfg["children"]:
                         if not _dbc_table_exists(conn, child):
                             continue
-                        cur = conn.execute(f"DELETE FROM {child} WHERE announcement_id IN ({placeholders})", ann_ids)
-                        child_deleted[child] = cur.rowcount
+                        deleted = 0
+                        for batch in _dbc_chunks(ann_ids):
+                            ph = ",".join("?" * len(batch))
+                            cur = conn.execute(f"DELETE FROM {child} WHERE announcement_id IN ({ph})", batch)
+                            deleted += cur.rowcount
+                        child_deleted[child] = deleted
                 cur = conn.execute(
                     f"DELETE FROM {table} WHERE {date_expr} BETWEEN ? AND ?",
                     (str(date_start), str(date_end)),
@@ -2980,17 +2992,20 @@ def dbc_run_cleanup(scope: dict, date_start, date_end, cascade_tracker: bool, va
                 for label, ids in deleted_ids_by_source.items():
                     if not ids:
                         continue
-                    placeholders = ",".join("?" * len(ids))
-                    tr_ids = [r[0] for r in conn.execute(
-                        f"SELECT id FROM announcement_tracker WHERE source=? AND source_announcement_id IN ({placeholders})",
-                        [label, *ids],
-                    ).fetchall()]
-                    if tr_ids:
-                        tph = ",".join("?" * len(tr_ids))
-                        conn.execute(f"DELETE FROM announcement_tracker_shadow WHERE tracker_id IN ({tph})", tr_ids)
-                        cur = conn.execute(f"DELETE FROM announcement_tracker WHERE id IN ({tph})", tr_ids)
+                    tr_ids = []
+                    for batch in _dbc_chunks(ids):
+                        ph = ",".join("?" * len(batch))
+                        rows = conn.execute(
+                            f"SELECT id FROM announcement_tracker WHERE source=? AND source_announcement_id IN ({ph})",
+                            [label, *batch],
+                        ).fetchall()
+                        tr_ids.extend(r[0] for r in rows)
+                    for batch in _dbc_chunks(tr_ids):
+                        tph = ",".join("?" * len(batch))
+                        conn.execute(f"DELETE FROM announcement_tracker_shadow WHERE tracker_id IN ({tph})", batch)
+                        cur = conn.execute(f"DELETE FROM announcement_tracker WHERE id IN ({tph})", batch)
                         tracker_deleted += cur.rowcount
-                        touched = True
+                        touched = touched or cur.rowcount > 0
                 conn.commit()
                 if vacuum and touched:
                     conn.execute("VACUUM")
