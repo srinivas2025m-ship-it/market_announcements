@@ -2173,52 +2173,6 @@ def at_query(sql: str, params: tuple = ()) -> pd.DataFrame:
         conn.close()
 
 
-# ─── Row-action widget — embedded in every source's Announcements sub-tab ───
-
-def at_render_row_actions(df: pd.DataFrame, source: str, kp: str, max_rows: int = 100):
-    """Renders a compact Track (📌) / Delete (🗑️) action list under a source's
-    results grid. `df` must include the raw `id` column from that source DB."""
-    if df.empty or "id" not in df.columns:
-        return
-    cfg = AT_SOURCE_FIELD_MAP[source]
-
-    with st.expander(f"🎯 Track / Delete individual announcements ({min(len(df), max_rows)} of {len(df)} shown)"):
-        confirm_key = f"{kp}_at_confirm_del_id"
-        for _, row in df.head(max_rows).iterrows():
-            rid = row.get("id")
-            rd = row.to_dict()
-            company = rd.get(cfg["company"]) or "—"
-            subject = (rd.get(cfg["subject"]) or "") if cfg["subject"] else ""
-            subject = (subject[:80] + "…") if len(subject) > 80 else subject
-
-            cols = st.columns([3.2, 3.6, 1.1, 1.1])
-            cols[0].write(f"**{company}**")
-            cols[1].caption(subject or "—")
-
-            already = at_is_tracked(source, rid)
-            if already:
-                cols[2].markdown(":green[📌 Tracked]")
-            else:
-                if cols[2].button("📌 Track", key=f"{kp}_at_track_{rid}", use_container_width=True):
-                    at_track_announcement(source, rd)
-                    st.rerun()
-
-            if st.session_state.get(confirm_key) == rid:
-                dc1, dc2 = cols[3].columns(2)
-                if dc1.button("✅", key=f"{kp}_at_delconf_{rid}", help="Confirm delete"):
-                    at_delete_source_announcement(source, rid)
-                    st.session_state[confirm_key] = None
-                    st.rerun()
-                if dc2.button("✖", key=f"{kp}_at_delcancel_{rid}", help="Cancel"):
-                    st.session_state[confirm_key] = None
-                    st.rerun()
-            else:
-                if cols[3].button("🗑️ Delete", key=f"{kp}_at_del_{rid}", use_container_width=True):
-                    st.session_state[confirm_key] = rid
-                    st.rerun()
-            st.divider()
-
-
 # ─── Announcement Tracker page — Search / Overview / Create (full CRUD) ────
 
 def atp_go_search():
@@ -2848,7 +2802,6 @@ if page == "Announcements":
                     for idx in (ev2.selection.rows if ev2 else []):
                         _log_view("BSE SME", bs_view.iloc[idx].to_dict())
                     st.download_button("⬇ Download CSV", df_bs.to_csv(index=False).encode(), "bse_sme_ann.csv", "text/csv")
-                    at_render_row_actions(df_bs, "BSE SME", "bs")
             else:
                 df_bc = load_bse_sme_corp(from_date, to_date, keyword)
                 if df_bc.empty:
@@ -2905,7 +2858,6 @@ if page == "Announcements":
                 for idx in (ev3.selection.rows if ev3 else []):
                     _log_view("NSE Equity", ne_view.iloc[idx].to_dict())
                 st.download_button("⬇ Download CSV", df_ne.to_csv(index=False).encode(), "nse_equity_results.csv", "text/csv")
-                at_render_row_actions(df_ne, "NSE Equity", "ne")
             _log_search("NSE Equity", {"keyword": keyword, "subject": ne_sub, "from": str(from_date), "to": str(to_date)}, len(df_ne))
 
         with ne_sub_idb:
@@ -2943,7 +2895,6 @@ if page == "Announcements":
                 for idx in (ev4.selection.rows if ev4 else []):
                     _log_view("NSE SME", ns_view.iloc[idx].to_dict())
                 st.download_button("⬇ Download CSV", df_ns.to_csv(index=False).encode(), "nse_sme_results.csv", "text/csv")
-                at_render_row_actions(df_ns, "NSE SME", "ns")
             _log_search("NSE SME", {"keyword": keyword, "subject": ns_sub, "from": str(from_date), "to": str(to_date)}, len(df_ns))
 
         with ns_sub_idb:
