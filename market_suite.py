@@ -194,7 +194,7 @@ footer{{visibility:hidden;}}
 ::-webkit-scrollbar-track{{background:transparent;}}
 ::-webkit-scrollbar-thumb{{background:{LINE};border-radius:8px;}}
 ::-webkit-scrollbar-thumb:hover{{background:{INK_MUTED};}}
-section[data-testid="stSidebar"]{{width:290px!important;min-width:290px!important;background:{SURFACE_2};border-right:1px solid {LINE};}}
+section[data-testid="stSidebar"]{{width:320px!important;min-width:320px!important;background:{SURFACE_2};border-right:1px solid {LINE};}}
 section[data-testid="stSidebar"]>div{{padding:1.3rem 1.1rem;}}
 .page-head{{margin-bottom:1.1rem;}}
 .page-head h1{{font-size:1.55rem;font-weight:600;color:{INK};margin:0;display:flex;align-items:center;gap:8px;letter-spacing:-0.01em;}}
@@ -260,8 +260,15 @@ div[data-testid="stPopover"] button{{
 div[data-testid="stPopover"] button:hover{{border-color:{ACCENT};color:{ACCENT};background:{ACCENT_BG};}}
 
 div[data-testid="stDataFrame"],div[data-testid="stTable"]{{border:1px solid {LINE};border-radius:10px;overflow:hidden;box-shadow:{SHADOW};}}
-div[data-testid="stDataFrame"] [role="columnheader"]{{background:{SURFACE_1}!important;color:{INK_SOFT}!important;font-weight:600!important;font-size:0.88rem!important;text-transform:uppercase;letter-spacing:0.04em;}}
+div[data-testid="stDataFrame"] [role="columnheader"]{{background:{SURFACE_1}!important;color:{INK_SOFT}!important;font-weight:600!important;font-size:1.28rem!important;text-transform:uppercase;letter-spacing:0.04em;}}
 div[data-testid="stDataFrame"] [role="row"]:hover{{background:{ACCENT_BG}!important;}}
+div[data-testid="stDataFrame"] [role="gridcell"],
+div[data-testid="stDataFrame"] [role="cell"]{{font-size:1.28rem!important;}}
+div[data-testid="stTable"] table{{font-size:1.28rem!important;}}
+div[data-testid="stTable"] th,div[data-testid="stTable"] td{{font-size:1.28rem!important;padding:0.5rem 0.75rem!important;}}
+div[data-testid="stDataEditor"] [role="columnheader"]{{font-size:1.28rem!important;font-weight:600!important;}}
+div[data-testid="stDataEditor"] [role="gridcell"],
+div[data-testid="stDataEditor"] [role="cell"]{{font-size:1.28rem!important;}}
 div[data-testid="stAlert"]{{border-radius:10px;border:1px solid {LINE};font-size:0.95rem;}}
 div[data-testid="stMetricValue"]{{font-family:'IBM Plex Mono',monospace;color:{INK};font-weight:600;font-size:1.9rem;}}
 div[data-testid="stMetricLabel"]{{color:{INK_MUTED};font-size:0.85rem;text-transform:uppercase;letter-spacing:0.05em;}}
