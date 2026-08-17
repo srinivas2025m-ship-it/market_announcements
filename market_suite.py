@@ -99,6 +99,19 @@ except Exception as e:
 
 IDEA_SOURCE_VIEW = "v_idea_source"  # matches announcement_ideas_pipeline.SOURCE_VIEW
 
+# ─── ARTICLE PLANNER deps — embedded Research & Article Planner ─────────────
+# db.py / utils.py belong to the standalone Research & Article Planner app
+# (its own planner.db, created next to these files). Imported as
+# planner_db / planner_utils so nothing here collides with market_suite's
+# own helpers. Both files must sit next to this one.
+try:
+    import db as planner_db
+    import utils as planner_utils
+    planner_db.init_db()
+    _PLANNER_OK, _PLANNER_ERR = True, ""
+except Exception as e:
+    _PLANNER_OK, _PLANNER_ERR = False, str(e)
+
 # ─── DB PATHS  (edit if your files live elsewhere) ───────────────────────────
 
 DB_PATHS = {
@@ -541,8 +554,8 @@ with st.sidebar:
     page = option_menu(
         menu_title="Dashboard",
         menu_icon="display",
-        options=["Announcements", "Announcement Tracker", "Charts", "Insights", "Calculators", "My Activity", "Guided Activity", "Guided DB Clean-up"],
-        icons=["file-earmark-text", "folder-symlink", "bar-chart-line", "lightbulb", "calculator", "clock-history", "compass", "trash3"],
+        options=["Announcements", "Announcement Tracker", "Charts", "Insights", "Calculators", "Article Planner", "My Activity", "Guided Activity", "Guided DB Clean-up"],
+        icons=["file-earmark-text", "folder-symlink", "bar-chart-line", "lightbulb", "calculator", "journal-bookmark", "clock-history", "compass", "trash3"],
         default_index=0,
         styles={
             "container":      {"padding":"0.9rem 0.8rem","background-color":SURFACE,"border-radius":"14px","box-shadow":SHADOW_MD},
@@ -892,6 +905,29 @@ def idb_get_date_bounds(db_path: str, mtime: float):
         return None, None
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def idb_get_scored_date_bounds(db_path: str, mtime: float):
+    """MIN/MAX input_timestamp restricted to rows that actually HAVE a score
+    — used only to make sure the Idea Board's default date filter can never
+    accidentally hide freshly-scored rows (e.g. a wide historical scrape
+    pushes the overall max date well past a scoring run that only covered
+    a single older day)."""
+    conn = _idb_connect(db_path)
+    try:
+        row = conn.execute(f"""
+            SELECT MIN(a.input_timestamp), MAX(a.input_timestamp)
+            FROM announcement_idea_scores s JOIN {IDEA_SOURCE_VIEW} a ON a.id = s.announcement_id
+        """).fetchone()
+    finally:
+        conn.close()
+    if not row or not row[0] or not row[1]:
+        return None, None
+    try:
+        return pd.to_datetime(row[0]).date(), pd.to_datetime(row[1]).date()
+    except Exception:
+        return None, None
+
+
 @st.cache_data(ttl=IDB_CACHE_TTL, show_spinner=False)
 def idb_get_type_counts(db_path: str, mtime: float, date_start, date_end):
     conn = _idb_connect(db_path)
@@ -901,10 +937,10 @@ def idb_get_type_counts(db_path: str, mtime: float, date_start, date_end):
                 SELECT s.idea_type_id AS id, COUNT(*) AS count, AVG(s.score) AS avg_score
                 FROM announcement_idea_scores s
                 JOIN {IDEA_SOURCE_VIEW} a ON a.id = s.announcement_id
-                WHERE a.input_timestamp >= ? AND a.input_timestamp <= ?
+                WHERE substr(a.input_timestamp, 1, 10) >= ? AND substr(a.input_timestamp, 1, 10) <= ?
                 GROUP BY s.idea_type_id
             """
-            df = pd.read_sql_query(q, conn, params=[f"{date_start} 00:00:00", f"{date_end} 23:59:59"])
+            df = pd.read_sql_query(q, conn, params=[str(date_start), str(date_end)])
         else:
             q = "SELECT idea_type_id AS id, COUNT(*) AS count, AVG(score) AS avg_score FROM announcement_idea_scores GROUP BY idea_type_id"
             df = pd.read_sql_query(q, conn)
@@ -921,8 +957,8 @@ def idb_get_summary_metrics(db_path: str, mtime: float, date_start, date_end):
             row = conn.execute(
                 f"""SELECT COUNT(DISTINCT s.announcement_id), COUNT(*)
                    FROM announcement_idea_scores s JOIN {IDEA_SOURCE_VIEW} a ON a.id = s.announcement_id
-                   WHERE a.input_timestamp >= ? AND a.input_timestamp <= ?""",
-                [f"{date_start} 00:00:00", f"{date_end} 23:59:59"],
+                   WHERE substr(a.input_timestamp, 1, 10) >= ? AND substr(a.input_timestamp, 1, 10) <= ?""",
+                [str(date_start), str(date_end)],
             ).fetchone()
         else:
             row = conn.execute(
@@ -937,8 +973,18 @@ def _idb_build_where(date_start, date_end, min_score, search, idea_type_ids):
     clauses = ["s.score >= ?"]
     params = [min_score]
     if date_start and date_end:
-        clauses.append("a.input_timestamp >= ? AND a.input_timestamp <= ?")
-        params += [f"{date_start} 00:00:00", f"{date_end} 23:59:59"]
+        # FIX: was a full-string range compare against literal "YYYY-MM-DD
+        # 00:00:00"/"YYYY-MM-DD 23:59:59" boundaries (assumes a SPACE between
+        # date and time). BSE Equity's input_timestamp is stored ISO8601
+        # with a "T" separator (e.g. "2026-08-09T20:46:30") — and 'T' (0x54)
+        # sorts *after* ' ' (0x20) in a plain string compare, so any same-day
+        # "T"-separated timestamp was always > the upper bound and silently
+        # excluded, even on the correct date. announcement_ideas_pipeline.py
+        # avoids this entirely by only comparing the first 10 chars (the
+        # date part) — do the same here so filtering matches the CLI/report
+        # regardless of the time-of-day separator.
+        clauses.append("substr(a.input_timestamp, 1, 10) >= ? AND substr(a.input_timestamp, 1, 10) <= ?")
+        params += [str(date_start), str(date_end)]
     if idea_type_ids:
         placeholders = ",".join("?" for _ in idea_type_ids)
         clauses.append(f"s.idea_type_id IN ({placeholders})")
@@ -1039,7 +1085,7 @@ def render_idea_board(db_path: str, kp: str, source_label: str = ""):
     idb_db_file = Path(idb_db_path)
     if not idb_db_file.exists():
         st.error(
-            f"Can't find `{idb_db_path}`. Run the pipeline first, e.g.\n\n"
+            f"Can't find `{idb_db_path}` (resolved to `{idb_db_file.resolve()}`). Run the pipeline first, e.g.\n\n"
             f"`python3 announcement_ideas_pipeline.py --db {idb_db_path} run`"
         )
         return
@@ -1069,17 +1115,71 @@ def render_idea_board(db_path: str, kp: str, source_label: str = ""):
     if idb_refresh:
         st.rerun()
 
+    # ---------------- diagnostics (unfiltered — sanity-checks the DB itself
+    # rather than any UI filter, so a "0 total" here means the scores never
+    # made it into *this* file, while "0 visible below" with a nonzero total
+    # means a filter is the problem instead) ----------------
+    _diag_conn = _idb_connect(str(idb_db_file))
+    try:
+        _diag_total = _diag_conn.execute("SELECT COUNT(*) FROM announcement_idea_scores").fetchone()[0]
+        _diag_last = _diag_conn.execute("SELECT MAX(scored_at) FROM announcement_idea_scores").fetchone()[0]
+    finally:
+        _diag_conn.close()
+    with st.expander(f"🔍 Diagnostics — {_diag_total:,} total scored row(s) in this file", expanded=(_diag_total == 0)):
+        st.caption(f"Reading: `{idb_db_file.resolve()}`  ·  last modified {pd.Timestamp(idb_mtime, unit='s')}")
+        st.caption(f"Total rows in `announcement_idea_scores` (no filters applied): **{_diag_total:,}**"
+                   + (f"  ·  most recent `scored_at`: **{_diag_last}**" if _diag_last else ""))
+        if _diag_total == 0:
+            st.warning(
+                "This file has zero scored rows. If you just ran the CLI pipeline and it reported matches "
+                "recorded, this almost always means the CLI wrote to a **different `bse_equity.db`** than the "
+                "one this page is reading (e.g. Streamlit was launched from a different working directory). "
+                "Compare the absolute path above against the one the CLI printed/used."
+            )
+
     # ---------------- filters ----------------
     bounds_min, bounds_max = idb_get_date_bounds(str(idb_db_file), idb_mtime)
+    scored_min, scored_max = idb_get_scored_date_bounds(str(idb_db_file), idb_mtime)
+
+    date_range_key = f"{kp}_idb_date_range"
 
     fcol1, fcol2, fcol3, fcol4 = st.columns([2, 2, 1, 1.3])
 
     with fcol1:
         if bounds_min and bounds_max:
+            # Default window must always contain every scored row, not just
+            # "last 6 days" — a wide historical scrape (bounds_max far past
+            # the day that was actually scored) would otherwise silently
+            # scroll fresh scores out of the default view.
+            default_end = bounds_max
             default_start = max(bounds_min, bounds_max - pd.Timedelta(days=6))
+            if scored_min:
+                default_start = min(default_start, scored_min)
+
+            # FIX: st.date_input with a `key` restores its value from
+            # session_state on every rerun and IGNORES `value=` once that key
+            # already exists — including across Streamlit's hot-reload
+            # "Rerun" (which reuses the same session, not just a fresh page
+            # load). So a date range picked in an earlier session — before
+            # scoring ran, or before this fix shipped — stays pinned even
+            # though the computed default above has since changed. Seed/
+            # correct session_state directly (rather than relying on
+            # `value=`, which Streamlit ignores once a key already has a
+            # stored value) so this self-heals on already-open sessions too.
+            if date_range_key not in st.session_state:
+                st.session_state[date_range_key] = (default_start, default_end)
+            else:
+                _stored = st.session_state[date_range_key]
+                if (
+                    isinstance(_stored, tuple) and len(_stored) == 2
+                    and scored_min and scored_max
+                    and (scored_min < _stored[0] or scored_max > _stored[1])
+                ):
+                    st.session_state[date_range_key] = (min(_stored[0], scored_min), max(_stored[1], scored_max))
+
             date_range = st.date_input(
-                "Date range", value=(default_start, bounds_max), min_value=bounds_min, max_value=bounds_max,
-                key=f"{kp}_idb_date_range",
+                "Date range", min_value=bounds_min, max_value=bounds_max,
+                key=date_range_key,
             )
             if isinstance(date_range, tuple) and len(date_range) == 2:
                 date_start, date_end = date_range
@@ -1096,12 +1196,24 @@ def render_idea_board(db_path: str, kp: str, source_label: str = ""):
     types["count"] = types["count"].fillna(0).astype(int)
     types["avg_score"] = types["avg_score"].fillna(0).round(1)
 
+    fcol2, fcol3, fcol4, fcol5 = st.columns([2, 1, 1.3, 1])
     with fcol2:
         search = st.text_input("Search company or subject", "", key=f"{kp}_idb_search")
     with fcol3:
         min_score = st.slider("Minimum score", 0, 100, 0, step=5, key=f"{kp}_idb_min_score")
     with fcol4:
         sort_by = st.selectbox("Sort by", ["Score (high to low)", "Date (newest first)"], key=f"{kp}_idb_sort_by")
+    with fcol5:
+        st.markdown("<div style='height:1.6rem'></div>", unsafe_allow_html=True)  # align with the widgets above
+        if st.button("↺ Reset filters", use_container_width=True, key=f"{kp}_idb_reset_filters",
+                     help="Clears search, minimum score, category drill-down, and the date range "
+                          "(back to a window that covers every scored row) — for whenever the board "
+                          "looks empty but Diagnostics above shows scored rows do exist."):
+            for k in (f"{kp}_idb_search", f"{kp}_idb_min_score", f"{kp}_idb_sort_by",
+                      date_range_key, f"{kp}_idb_nav_group", f"{kp}_idb_nav_type"):
+                st.session_state.pop(k, None)
+            st.cache_data.clear()
+            st.rerun()
 
     nav_group_key = f"{kp}_idb_nav_group"
     nav_type_key = f"{kp}_idb_nav_type"
@@ -2986,6 +3098,296 @@ def dbc_run_cleanup(scope: dict, date_start, date_end, cascade_tracker: bool, va
 #  PAGE: ANNOUNCEMENTS
 # ═════════════════════════════════════════════════════════════════════════════
 
+
+# ═════════════════════════════════════════════════════════════════════════════
+#  ARTICLE PLANNER  (embedded — from the standalone Research & Article
+#  Planner app: db.py / utils.py, imported above as planner_db / planner_utils)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _planner_render_article_list(items, tab_key):
+    """Shared CRUD list renderer. tab_key must be unique per tab so widget
+    keys don't collide when the same article appears in more than one tab."""
+    if not items:
+        st.info("No items match these filters.")
+        return
+    for item in items:
+        with st.expander(
+            f"[{item['category']}] {item['title']}  —  {item['status']}  "
+            f"({planner_utils.days_label(item['planned_date'])})"
+        ):
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                st.markdown(f"**Link:** {item['url']}")
+                st.markdown(f"**Tags:** {item['tags'] or '—'}")
+                st.markdown(f"**Note:** {item['notes'] or '—'}")
+                if item["is_recurring"]:
+                    st.markdown(f"🔁 Recurring: **{item['recurrence']}** — next due **{item['next_due_date']}**")
+            with c2:
+                new_status = st.selectbox(
+                    "Status", planner_db.STATUSES,
+                    index=planner_db.STATUSES.index(item["status"]),
+                    key=f"planner_status_{tab_key}_{item['id']}",
+                )
+                new_planned = st.date_input(
+                    "Planned date",
+                    value=date.fromisoformat(item["planned_date"]) if item["planned_date"] else date.today(),
+                    key=f"planner_date_{tab_key}_{item['id']}",
+                )
+                new_note = st.text_input("Edit note", value=item["notes"] or "",
+                                          key=f"planner_note_{tab_key}_{item['id']}")
+
+                bcol1, bcol2, bcol3 = st.columns(3)
+                if bcol1.button("💾 Save", key=f"planner_save_{tab_key}_{item['id']}"):
+                    planner_db.update_article(item["id"], status=new_status,
+                                               planned_date=new_planned.isoformat(),
+                                               notes=new_note)
+                    st.rerun()
+                if bcol2.button("✅ Complete", key=f"planner_complete_{tab_key}_{item['id']}"):
+                    planner_db.mark_complete(item["id"])
+                    st.rerun()
+                if bcol3.button("🗑️ Delete", key=f"planner_delete_{tab_key}_{item['id']}"):
+                    planner_db.delete_article(item["id"])
+                    st.rerun()
+
+
+def planner_page_add_item_body(key_prefix=""):
+    tab_article, tab_youtube = st.tabs(["📄 Article", "🎥 YouTube Link"])
+
+    def _add_form(tab_key, source_type):
+        with st.form(f"planner_add_item_form_{key_prefix}{tab_key}", clear_on_submit=True):
+            title = st.text_input("Title *", key=f"planner_title_{key_prefix}{tab_key}")
+            url = st.text_input(f"{source_type} URL *", key=f"planner_url_{key_prefix}{tab_key}")
+            category = st.selectbox("Category", planner_db.CATEGORIES, key=f"planner_category_{key_prefix}{tab_key}")
+            tags = st.text_input("Tags (comma-separated — e.g. company/industry name)",
+                                  key=f"planner_tags_{key_prefix}{tab_key}")
+            planned_date = st.date_input("Target completion date", value=date.today(),
+                                          key=f"planner_planned_{key_prefix}{tab_key}")
+            is_recurring = st.checkbox("This is a recurring report (Yearly/Monthly)",
+                                        key=f"planner_recurring_{key_prefix}{tab_key}")
+            recurrence = st.selectbox("Recurrence", planner_db.RECURRENCE, index=0,
+                                       disabled=not is_recurring, key=f"planner_recurrence_{key_prefix}{tab_key}")
+            notes = st.text_area("Short note (for review/trace)", key=f"planner_notes_{key_prefix}{tab_key}")
+
+            submitted = st.form_submit_button(f"Add {source_type}")
+            if submitted:
+                if not title or not url:
+                    st.error("Title and URL are required.")
+                else:
+                    planner_db.add_article(
+                        title=title, url=url, source_type=source_type,
+                        category=category, tags=tags,
+                        planned_date=planned_date.isoformat(),
+                        is_recurring=is_recurring,
+                        recurrence=recurrence if is_recurring else "None",
+                        notes=notes,
+                    )
+                    st.success(f"Added '{title}' to the planner.")
+
+    with tab_article:
+        _add_form("article", "Article")
+    with tab_youtube:
+        _add_form("youtube", "YouTube")
+
+
+def planner_page_manage_search_body(key_prefix=""):
+    st.caption("Full CRUD — filter, edit, mark complete, or delete any item.")
+
+    tab_labels = ["All"] + planner_db.CATEGORIES
+    tabs = st.tabs(tab_labels)
+
+    for label, tab in zip(tab_labels, tabs):
+        with tab:
+            fcol1, fcol2, fcol3 = st.columns(3)
+            f_status = fcol1.selectbox("Status", ["All"] + planner_db.STATUSES, key=f"planner_status_filter_{key_prefix}{label}")
+            f_type = fcol2.selectbox("Type", ["All"] + planner_db.SOURCE_TYPES, key=f"planner_type_filter_{key_prefix}{label}")
+            f_search = fcol3.text_input("Search title / tags / notes", key=f"planner_search_filter_{key_prefix}{label}")
+
+            items = planner_db.get_articles(
+                category=None if label == "All" else label,
+                status=f_status, search=f_search, source_type=f_type,
+            )
+            _planner_render_article_list(items, tab_key=f"{key_prefix}{label}")
+
+
+def planner_page_recurring_reports_body(key_prefix=""):
+    st.caption("Yearly/Monthly reports you track — with a one-click search "
+               "recommendation to find the latest edition.")
+
+    tab_all, tab_monthly, tab_yearly = st.tabs(["All", "Monthly", "Yearly"])
+
+    def _render_recurring(items, tab_key):
+        if not items:
+            st.info("No recurring items in this view yet.")
+            return
+        df_rows = [{
+            "id": r["id"], "title": r["title"], "category": r["category"],
+            "recurrence": r["recurrence"], "next_due_date": r["next_due_date"],
+            "status": r["status"],
+        } for r in items]
+        st.dataframe(pd.DataFrame(df_rows), use_container_width=True, hide_index=True)
+
+        st.subheader("Search for the latest edition")
+        for r in items:
+            c1, c2, c3 = st.columns([3, 1, 1])
+            c1.markdown(f"**{r['title']}** ({r['category']}, {r['recurrence']}) — due {r['next_due_date']}")
+            c2.link_button("🔎 Search now", planner_utils.search_recommendation_url(r["title"]), key=f"planner_search_{tab_key}_{r['id']}")
+            if c3.button("Mark found & reset", key=f"planner_reset_{tab_key}_{r['id']}"):
+                planner_db.update_article(r["id"], status="Not Started")
+                st.rerun()
+
+    recurring = planner_db.get_recurring()
+    with tab_all:
+        _render_recurring(recurring, f"{key_prefix}all")
+    with tab_monthly:
+        _render_recurring([r for r in recurring if r["recurrence"] == "Monthly"], f"{key_prefix}monthly")
+    with tab_yearly:
+        _render_recurring([r for r in recurring if r["recurrence"] == "Yearly"], f"{key_prefix}yearly")
+
+
+def planner_page_write_article_body(key_prefix=""):
+    tab_labels = ["All"] + planner_db.CATEGORIES
+    tabs = st.tabs(tab_labels)
+
+    for label, tab in zip(tab_labels, tabs):
+        with tab:
+            all_items = planner_db.get_articles(category=None if label == "All" else label)
+            if not all_items:
+                st.info("No source items in this category yet.")
+                continue
+
+            options = {planner_utils.article_picker_label(a): a["id"] for a in all_items}
+            chosen_labels = st.multiselect(
+                "Select source articles/videos to base this on",
+                list(options.keys()), key=f"planner_sources_{key_prefix}{label}",
+            )
+            source_ids = [options[l] for l in chosen_labels]
+
+            if source_ids:
+                st.markdown("**Selected source notes (for reference):**")
+                for a in all_items:
+                    if a["id"] in source_ids:
+                        st.markdown(f"- **{a['title']}** — {a['notes'] or 'no note'}  \n  {a['url']}")
+
+            with st.form(f"planner_write_article_form_{key_prefix}{label}"):
+                title = st.text_input("New article title", key=f"planner_new_title_{key_prefix}{label}")
+                category = st.selectbox(
+                    "Category", planner_db.CATEGORIES,
+                    index=planner_db.CATEGORIES.index(label) if label in planner_db.CATEGORIES else 0,
+                    key=f"planner_new_category_{key_prefix}{label}",
+                )
+                content = st.text_area("Content / draft", height=300, key=f"planner_new_content_{key_prefix}{label}")
+                submitted = st.form_submit_button("Save article")
+                if submitted:
+                    if not title:
+                        st.error("Title is required.")
+                    else:
+                        planner_db.add_derived_article(title, category, content, source_ids)
+                        st.success(f"Saved '{title}'.")
+
+
+def planner_page_my_articles_body(key_prefix=""):
+    tab_labels = ["All"] + planner_db.CATEGORIES
+    tabs = st.tabs(tab_labels)
+    derived = planner_db.get_derived_articles()
+
+    for label, tab in zip(tab_labels, tabs):
+        with tab:
+            filtered = derived if label == "All" else [d for d in derived if d["category"] == label]
+            if not filtered:
+                st.info("You haven't written any articles in this category yet.")
+                continue
+            for d in filtered:
+                with st.expander(f"[{d['category']}] {d['title']}"):
+                    st.caption(f"Created {d['created_at']}")
+                    src_txt = ", ".join(s["title"] for s in d["sources"]) or "none"
+                    st.markdown(f"**Sources:** {src_txt}")
+                    new_content = st.text_area(
+                        "Content", value=d["content"], height=250,
+                        key=f"planner_content_{key_prefix}{label}_{d['id']}",
+                    )
+                    c1, c2 = st.columns(2)
+                    if c1.button("💾 Save changes", key=f"planner_save_derived_{key_prefix}{label}_{d['id']}"):
+                        planner_db.update_derived_article(d["id"], content=new_content)
+                        st.rerun()
+                    if c2.button("🗑️ Delete", key=f"planner_delete_derived_{key_prefix}{label}_{d['id']}"):
+                        planner_db.delete_derived_article(d["id"])
+                        st.rerun()
+
+
+def planner_render_dashboard():
+    """Embeds the planner's own Dashboard page — the same tab structure it
+    uses standalone (Overview/Reminders/By Category + the 5 other sections
+    as tabs) — inline inside market_suite's 'Article Planner' page."""
+    quick_tabs = st.tabs([
+        "🏠 Dashboard",
+        "📄 Add Article / YouTube Link",
+        "🔍 Manage & Search Articles",
+        "🔁 Recurring Reports",
+        "✍️ Write an Article from Your Research",
+        "📚 My Written Articles",
+    ])
+
+    with quick_tabs[0]:
+        tab_overview, tab_reminders, tab_by_category = st.tabs(
+            ["📊 Overview", "⏰ Reminders", "🗂️ By Category"]
+        )
+
+        stats = planner_db.get_stats()
+        overdue = planner_db.get_overdue()
+        due_soon = planner_db.get_due_soon(days=3)
+
+        with tab_overview:
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total items", stats["total"])
+            col2.metric("Completed", stats["completed"])
+            col3.metric("Open / Pending", stats["total"] - stats["completed"])
+            if overdue:
+                st.error(f"⚠️ {len(overdue)} item(s) overdue — see the Reminders tab.")
+            else:
+                st.success("No overdue items 🎉")
+
+        with tab_reminders:
+            if overdue:
+                st.error(f"⚠️ {len(overdue)} item(s) overdue — reminder!")
+                st.dataframe(
+                    pd.DataFrame(overdue)[["id", "title", "category", "source_type", "planned_date", "status"]],
+                    use_container_width=True, hide_index=True,
+                )
+            else:
+                st.success("No overdue items 🎉")
+
+            if due_soon:
+                st.warning(f"🟡 {len(due_soon)} item(s) due within 3 days")
+                st.dataframe(
+                    pd.DataFrame(due_soon)[["id", "title", "category", "source_type", "planned_date", "status"]],
+                    use_container_width=True, hide_index=True,
+                )
+            else:
+                st.info("Nothing due in the next 3 days.")
+
+        with tab_by_category:
+            if stats["by_category"]:
+                cat_df = pd.DataFrame(stats["by_category"])
+                cat_df["remaining"] = cat_df["c"] - cat_df["done"].fillna(0)
+                cat_df = cat_df.rename(columns={"c": "total", "done": "completed"})
+                st.bar_chart(cat_df.set_index("category")[["completed", "remaining"]])
+                st.dataframe(cat_df, use_container_width=True, hide_index=True)
+            else:
+                st.info("Add your first article or YouTube link to see stats here.")
+
+    with quick_tabs[1]:
+        planner_page_add_item_body(key_prefix="ms_")
+    with quick_tabs[2]:
+        planner_page_manage_search_body(key_prefix="ms_")
+    with quick_tabs[3]:
+        planner_page_recurring_reports_body(key_prefix="ms_")
+    with quick_tabs[4]:
+        planner_page_write_article_body(key_prefix="ms_")
+    with quick_tabs[5]:
+        planner_page_my_articles_body(key_prefix="ms_")
+
+
+
 if page == "Announcements":
 
     st.markdown("""<div class="page-head">
@@ -4513,3 +4915,12 @@ elif page == "Guided DB Clean-up":
                     st.success("Clean-up complete.")
             else:
                 st.info("No clean-up run yet this session.")
+elif page == "Article Planner":
+    st.title("Article Planner")
+    if not _PLANNER_OK:
+        st.error(
+            "Couldn't load the Article Planner — db.py / utils.py must sit next to market_suite.py.\n\n"
+            f"Import error: {_PLANNER_ERR}"
+        )
+    else:
+        planner_render_dashboard()
