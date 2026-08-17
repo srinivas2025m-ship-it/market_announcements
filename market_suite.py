@@ -185,7 +185,7 @@ st.markdown(f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap');
 :root{{--ink:{INK};--ink-soft:{INK_SOFT};--ink-muted:{INK_MUTED};--line:{LINE};--surface:{SURFACE};--surface-1:{SURFACE_1};--accent:{ACCENT};--accent-bg:{ACCENT_BG};}}
-html,body,[class*="css"]{{font-family:'IBM Plex Sans',sans-serif;color:{INK};-webkit-font-smoothing:antialiased;}}
+html,body,[class*="css"]{{font-family:'IBM Plex Sans',sans-serif;color:{INK};font-size:16.5px;-webkit-font-smoothing:antialiased;}}
 .stApp{{background:{SURFACE};}}
 .block-container{{padding-top:1.25rem;padding-bottom:3rem;max-width:1400px;}}
 #MainMenu,header[data-testid="stHeader"]{{background:transparent;}}
@@ -194,22 +194,22 @@ footer{{visibility:hidden;}}
 ::-webkit-scrollbar-track{{background:transparent;}}
 ::-webkit-scrollbar-thumb{{background:{LINE};border-radius:8px;}}
 ::-webkit-scrollbar-thumb:hover{{background:{INK_MUTED};}}
-section[data-testid="stSidebar"]{{width:240px!important;min-width:240px!important;background:{SURFACE_2};border-right:1px solid {LINE};}}
-section[data-testid="stSidebar"]>div{{padding:1.1rem 0.9rem;}}
+section[data-testid="stSidebar"]{{width:290px!important;min-width:290px!important;background:{SURFACE_2};border-right:1px solid {LINE};}}
+section[data-testid="stSidebar"]>div{{padding:1.3rem 1.1rem;}}
 .page-head{{margin-bottom:1.1rem;}}
-.page-head h1{{font-size:1.35rem;font-weight:600;color:{INK};margin:0;display:flex;align-items:center;gap:8px;letter-spacing:-0.01em;}}
-.page-head p{{font-size:0.85rem;color:{INK_MUTED};margin:3px 0 0;}}
+.page-head h1{{font-size:1.55rem;font-weight:600;color:{INK};margin:0;display:flex;align-items:center;gap:8px;letter-spacing:-0.01em;}}
+.page-head p{{font-size:0.98rem;color:{INK_MUTED};margin:3px 0 0;}}
 .filter-bar{{background:{SURFACE};border:1px solid {LINE};border-radius:12px;padding:0.85rem 1rem 0.55rem;margin-bottom:1.1rem;box-shadow:{SHADOW};}}
-.filter-bar-label{{font-size:0.68rem;font-weight:600;color:{INK_MUTED};text-transform:uppercase;letter-spacing:0.08em;margin-bottom:0.55rem;display:flex;align-items:center;gap:6px;}}
+.filter-bar-label{{font-size:0.8rem;font-weight:600;color:{INK_MUTED};text-transform:uppercase;letter-spacing:0.08em;margin-bottom:0.55rem;display:flex;align-items:center;gap:6px;}}
 .filter-bar-label::before{{content:'';width:3px;height:11px;background:{ACCENT};border-radius:2px;}}
 .field-spacer{{height:1.55rem;}}
 .metric-card{{background:{SURFACE_1};border:1px solid {LINE};border-radius:10px;padding:0.9rem 1.05rem;text-align:left;transition:border-color 0.15s ease,box-shadow 0.15s ease;}}
 .metric-card:hover{{border-color:{INK_MUTED};box-shadow:{SHADOW};}}
-.metric-card .val{{font-size:1.55rem;font-weight:600;color:{INK};font-family:'IBM Plex Mono',monospace;line-height:1.1;letter-spacing:-0.01em;}}
-.metric-card .lbl{{font-size:0.7rem;color:{INK_MUTED};text-transform:uppercase;letter-spacing:0.07em;margin-top:5px;font-weight:500;}}
-.source-badge{{display:inline-block;padding:2px 8px;border-radius:20px;font-size:0.7rem;font-weight:600;letter-spacing:0.04em;margin-bottom:0.5rem;}}
+.metric-card .val{{font-size:1.8rem;font-weight:600;color:{INK};font-family:'IBM Plex Mono',monospace;line-height:1.1;letter-spacing:-0.01em;}}
+.metric-card .lbl{{font-size:0.82rem;color:{INK_MUTED};text-transform:uppercase;letter-spacing:0.07em;margin-top:5px;font-weight:500;}}
+.source-badge{{display:inline-block;padding:2px 8px;border-radius:20px;font-size:0.82rem;font-weight:600;letter-spacing:0.04em;margin-bottom:0.5rem;}}
 .stTabs [data-baseweb="tab-list"]{{gap:4px;border-bottom:1px solid {LINE};}}
-.stTabs [data-baseweb="tab"]{{font-family:'IBM Plex Sans',sans-serif;font-size:0.82rem;font-weight:500;letter-spacing:0.01em;color:{INK_SOFT};padding:0.55rem 1rem;transition:color 0.15s ease;}}
+.stTabs [data-baseweb="tab"]{{font-family:'IBM Plex Sans',sans-serif;font-size:0.95rem;font-weight:500;letter-spacing:0.01em;color:{INK_SOFT};padding:0.65rem 1.15rem;transition:color 0.15s ease;}}
 .stTabs [data-baseweb="tab"]:hover{{color:{ACCENT};}}
 .stTabs [aria-selected="true"]{{color:{ACCENT}!important;font-weight:600;}}
 .stTabs [data-baseweb="tab-highlight"]{{background-color:{ACCENT}!important;height:2.5px;}}
@@ -217,7 +217,7 @@ section[data-testid="stSidebar"]>div{{padding:1.1rem 0.9rem;}}
 /* ── Form controls: one consistent, compact height + focus language ──────── */
 div[data-testid="stTextInput"] input,
 div[data-testid="stDateInput"] input{{
-  font-size:0.82rem;height:2.35rem;padding:0 0.65rem;border-radius:8px!important;
+  font-size:0.95rem;height:2.55rem;padding:0 0.7rem;border-radius:8px!important;
   border:1px solid {LINE}!important;background:{SURFACE_1};
   transition:border-color 0.14s ease,box-shadow 0.14s ease,background 0.14s ease;
 }}
@@ -226,10 +226,10 @@ div[data-testid="stDateInput"] input:focus{{
   border-color:{ACCENT}!important;background:{SURFACE};box-shadow:0 0 0 3px {ACCENT_BG}!important;
 }}
 div[data-testid="stDateInput"] div[data-baseweb="base-input"]{{border-radius:8px!important;}}
-div[data-testid="stDateInput"] svg{{width:14px;height:14px;color:{INK_MUTED};}}
+div[data-testid="stDateInput"] svg{{width:15px;height:15px;color:{INK_MUTED};}}
 div[data-testid="stSelectbox"] div[data-baseweb="select"]>div,
 div[data-testid="stMultiSelect"] div[data-baseweb="select"]>div{{
-  min-height:2.35rem;font-size:0.82rem;border-radius:8px!important;
+  min-height:2.55rem;font-size:0.95rem;border-radius:8px!important;
   border:1px solid {LINE}!important;background:{SURFACE_1};
   transition:border-color 0.14s ease,box-shadow 0.14s ease;
 }}
@@ -239,34 +239,34 @@ div[data-testid="stSelectbox"] div[data-baseweb="select"]:focus-within>div,
 div[data-testid="stMultiSelect"] div[data-baseweb="select"]:focus-within>div{{
   border-color:{ACCENT}!important;box-shadow:0 0 0 3px {ACCENT_BG};
 }}
-.stMultiSelect span[data-baseweb="tag"]{{background:{ACCENT_BG}!important;color:{ACCENT_DK}!important;border-radius:6px!important;font-size:0.76rem!important;}}
-label[data-testid="stWidgetLabel"]{{margin-bottom:0.3rem;}}
-label[data-testid="stWidgetLabel"] p{{font-size:0.76rem;color:{INK_SOFT};font-weight:500;letter-spacing:0.01em;}}
+.stMultiSelect span[data-baseweb="tag"]{{background:{ACCENT_BG}!important;color:{ACCENT_DK}!important;border-radius:6px!important;font-size:0.86rem!important;}}
+label[data-testid="stWidgetLabel"]{{margin-bottom:0.35rem;}}
+label[data-testid="stWidgetLabel"] p{{font-size:0.88rem;color:{INK_SOFT};font-weight:500;letter-spacing:0.01em;}}
 
 /* ── Buttons: match input height so rows line up ─────────────────────────── */
 .stButton button,.stDownloadButton button{{
-  border-radius:8px;border:1px solid {LINE};font-weight:500;font-size:0.82rem;
-  color:{INK_SOFT};background:{SURFACE};height:2.35rem;padding:0 0.9rem;
+  border-radius:8px;border:1px solid {LINE};font-weight:500;font-size:0.95rem;
+  color:{INK_SOFT};background:{SURFACE};height:2.55rem;padding:0 1rem;
   transition:all 0.14s ease;box-shadow:none;
 }}
 .stButton button:hover,.stDownloadButton button:hover{{border-color:{ACCENT};color:{ACCENT};background:{ACCENT_BG};}}
 .stButton button[kind="primary"],.stButton button[data-testid="baseButton-primary"]{{background:{ACCENT};border-color:{ACCENT};color:#fff;}}
 .stButton button[kind="primary"]:hover{{background:{ACCENT_DK};border-color:{ACCENT_DK};color:#fff;}}
 div[data-testid="stPopover"] button{{
-  border-radius:8px;border:1px solid {LINE};font-size:0.78rem;font-weight:500;
-  color:{INK_SOFT};background:{SURFACE};padding:0.3rem 0.7rem;
+  border-radius:8px;border:1px solid {LINE};font-size:0.9rem;font-weight:500;
+  color:{INK_SOFT};background:{SURFACE};padding:0.35rem 0.8rem;
   transition:all 0.14s ease;box-shadow:none;
 }}
 div[data-testid="stPopover"] button:hover{{border-color:{ACCENT};color:{ACCENT};background:{ACCENT_BG};}}
 
 div[data-testid="stDataFrame"],div[data-testid="stTable"]{{border:1px solid {LINE};border-radius:10px;overflow:hidden;box-shadow:{SHADOW};}}
-div[data-testid="stDataFrame"] [role="columnheader"]{{background:{SURFACE_1}!important;color:{INK_SOFT}!important;font-weight:600!important;font-size:0.78rem!important;text-transform:uppercase;letter-spacing:0.04em;}}
+div[data-testid="stDataFrame"] [role="columnheader"]{{background:{SURFACE_1}!important;color:{INK_SOFT}!important;font-weight:600!important;font-size:0.88rem!important;text-transform:uppercase;letter-spacing:0.04em;}}
 div[data-testid="stDataFrame"] [role="row"]:hover{{background:{ACCENT_BG}!important;}}
-div[data-testid="stAlert"]{{border-radius:10px;border:1px solid {LINE};font-size:0.85rem;}}
-div[data-testid="stMetricValue"]{{font-family:'IBM Plex Mono',monospace;color:{INK};font-weight:600;}}
-div[data-testid="stMetricLabel"]{{color:{INK_MUTED};font-size:0.75rem;text-transform:uppercase;letter-spacing:0.05em;}}
+div[data-testid="stAlert"]{{border-radius:10px;border:1px solid {LINE};font-size:0.95rem;}}
+div[data-testid="stMetricValue"]{{font-family:'IBM Plex Mono',monospace;color:{INK};font-weight:600;font-size:1.9rem;}}
+div[data-testid="stMetricLabel"]{{color:{INK_MUTED};font-size:0.85rem;text-transform:uppercase;letter-spacing:0.05em;}}
 hr{{border-color:{LINE}!important;margin:1.2rem 0;}}
-.stCaption,[data-testid="stCaptionContainer"]{{color:{INK_MUTED}!important;}}
+.stCaption,[data-testid="stCaptionContainer"]{{color:{INK_MUTED}!important;font-size:0.88rem!important;}}
 a{{color:{ACCENT};text-decoration:none;}}
 a:hover{{text-decoration:underline;}}
 .main .block-container{{animation:fadeIn 0.25s ease;}}
@@ -281,17 +281,17 @@ st.markdown("""
 .idb-card{background:var(--background-color,#fff);border:1px solid rgba(120,120,120,0.25);
   border-radius:8px;padding:14px;margin-bottom:12px;}
 .idb-top{display:flex;justify-content:space-between;align-items:flex-start;gap:8px;}
-.idb-company{font-weight:600;font-size:14px;}
-.idb-symbol{font-family:monospace;font-size:11px;opacity:0.65;}
-.idb-subject{font-size:13px;opacity:0.85;margin:6px 0;line-height:1.5;}
-.idb-score{font-family:monospace;font-weight:700;font-size:13px;padding:2px 8px;border-radius:10px;}
+.idb-company{font-weight:600;font-size:16px;}
+.idb-symbol{font-family:monospace;font-size:13px;opacity:0.65;}
+.idb-subject{font-size:15px;opacity:0.85;margin:6px 0;line-height:1.55;}
+.idb-score{font-family:monospace;font-weight:700;font-size:15px;padding:2px 8px;border-radius:10px;}
 .idb-score.high{background:#E1F5EE;color:#085041;}
 .idb-score.mid{background:#FAEEDA;color:#633806;}
 .idb-score.low{background:#FAECE7;color:#712B13;}
-.idb-kw{display:inline-block;font-family:monospace;font-size:10.5px;background:#E1F5EE;
+.idb-kw{display:inline-block;font-family:monospace;font-size:12px;background:#E1F5EE;
   color:#085041;padding:2px 6px;border-radius:3px;margin:2px 4px 0 0;}
 .idb-kw.cat{background:#FAEEDA;color:#633806;}
-.idb-ts{font-family:monospace;font-size:10.5px;opacity:0.55;margin-top:8px;}
+.idb-ts{font-family:monospace;font-size:12px;opacity:0.55;margin-top:8px;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -537,17 +537,17 @@ def _log_search(source, filters, result_count):
 with st.sidebar:
     st.markdown(f"""
     <div style="background:{SURFACE};border:1px solid {LINE};border-radius:10px;
-         padding:0.6rem 0.75rem;margin-bottom:0.7rem;display:flex;align-items:center;gap:8px;">
-      <div style="width:30px;height:30px;border-radius:50%;background:{ACCENT_BG};
+         padding:0.75rem 0.9rem;margin-bottom:0.9rem;display:flex;align-items:center;gap:10px;">
+      <div style="width:36px;height:36px;border-radius:50%;background:{ACCENT_BG};
            color:{ACCENT_DK};display:flex;align-items:center;justify-content:center;
-           font-weight:600;font-size:0.78rem;flex-shrink:0;">
+           font-weight:600;font-size:0.92rem;flex-shrink:0;">
         {(current_name or current_user or "?")[:1].upper()}
       </div>
       <div style="overflow:hidden;">
-        <div style="font-size:0.82rem;font-weight:600;color:{INK};white-space:nowrap;text-overflow:ellipsis;overflow:hidden;">
+        <div style="font-size:0.95rem;font-weight:600;color:{INK};white-space:nowrap;text-overflow:ellipsis;overflow:hidden;">
           {current_name or current_user}
         </div>
-        <div style="font-size:0.68rem;color:{INK_MUTED};">@{current_user}</div>
+        <div style="font-size:0.8rem;color:{INK_MUTED};">@{current_user}</div>
       </div>
     </div>""", unsafe_allow_html=True)
 
@@ -558,15 +558,15 @@ with st.sidebar:
         icons=["file-earmark-text", "folder-symlink", "bar-chart-line", "lightbulb", "calculator", "journal-bookmark", "clock-history", "compass", "trash3"],
         default_index=0,
         styles={
-            "container":      {"padding":"0.9rem 0.8rem","background-color":SURFACE,"border-radius":"14px","box-shadow":SHADOW_MD},
-            "menu-title":     {"font-size":"1.1rem","font-weight":"600","color":INK,"padding":"0 0 0.7rem 0.2rem"},
-            "icon":           {"font-size":"0.95rem","color":INK_MUTED},
-            "nav-link":       {"font-size":"0.88rem","font-weight":"500","color":INK_SOFT,"text-align":"left","margin":"2px 0","padding":"0.6rem 0.7rem","border-radius":"8px"},
+            "container":      {"padding":"1.1rem 0.9rem","background-color":SURFACE,"border-radius":"14px","box-shadow":SHADOW_MD},
+            "menu-title":     {"font-size":"1.3rem","font-weight":"600","color":INK,"padding":"0 0 0.9rem 0.2rem"},
+            "icon":           {"font-size":"1.15rem","color":INK_MUTED},
+            "nav-link":       {"font-size":"1.02rem","font-weight":"500","color":INK_SOFT,"text-align":"left","margin":"5px 0","padding":"0.85rem 0.9rem","border-radius":"9px"},
             "nav-link-selected": {"background-color":ACCENT_BG,"color":ACCENT_DK,"font-weight":"600"},
         },
     )
 
-    st.markdown("<div style='height:0.6rem'></div>", unsafe_allow_html=True)
+    st.markdown("<div style='height:0.7rem'></div>", unsafe_allow_html=True)
     if st.button("Log out", use_container_width=True):
         st.session_state["auth_user"] = None
         st.rerun()
@@ -1366,7 +1366,7 @@ def render_idea_board(db_path: str, kp: str, source_label: str = ""):
             start_n = offset + 1
             end_n = min(offset + IDB_PAGE_SIZE, total_items)
             st.markdown(
-                f"<div style='text-align:center;padding-top:6px;font-size:13px;color:var(--text-secondary,#666);'>"
+                f"<div style='text-align:center;padding-top:6px;font-size:15px;color:var(--text-secondary,#666);'>"
                 f"Showing {start_n}–{end_n} of {total_items} &middot; page {idb_page} of {total_pages}</div>",
                 unsafe_allow_html=True,
             )
